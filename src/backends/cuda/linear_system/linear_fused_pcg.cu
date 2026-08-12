@@ -5,16 +5,41 @@
 #include <cub/warp/warp_reduce.cuh>
 #include <linear_system/fused_pcg_kernels.h>
 #include <muda/check/check_cuda_errors.h>
-#include <muda/profiler.h>
+#if MUDA_NVTX3_ON
+#include <nvtx3/nvToolsExt.h>
+#endif
 #include <algorithm>
 namespace uipc::backend::cuda
 {
 namespace
 {
+    class PcgNvtxRange
+    {
+      public:
+        explicit PcgNvtxRange(const char* name) noexcept
+        {
+#if MUDA_NVTX3_ON
+            nvtxRangePushA(name);
+#else
+            static_cast<void>(name);
+#endif
+        }
+
+        ~PcgNvtxRange()
+        {
+#if MUDA_NVTX3_ON
+            nvtxRangePop();
+#endif
+        }
+
+        PcgNvtxRange(const PcgNvtxRange&)            = delete;
+        PcgNvtxRange& operator=(const PcgNvtxRange&) = delete;
+    };
+
     void fused_dot(muda::CDenseVectorView<Float> x,
                    muda::CDenseVectorView<Float> y,
                    muda::VarView<Float>          d_result);
-}
+}  // namespace
 
 REGISTER_SIM_SYSTEM(LinearFusedPCG);
 
@@ -191,7 +216,7 @@ void LinearFusedPCG::capture_graph(cudaGraphExec_t&             graph_exec,
 void LinearFusedPCG::rebuild_graphs(muda::DenseVectorView<Float>  x,
                                     const FusedPcgGraphSignature& signature)
 {
-    muda::RangeName range{"libuipc/PCG/graph/rebuild"};
+    PcgNvtxRange range{"libuipc/PCG/graph/rebuild"};
     destroy_graphs();
     const IndexT interval = static_cast<IndexT>(check_interval);
     capture_graph(graph_start_slot_0, x, interval, 0);
@@ -341,11 +366,11 @@ SizeT LinearFusedPCG::graph_fused_pcg(muda::DenseVectorView<Float>  x,
         cudaGraphExec_t graph = (completed & 1) == 0 ? graph_start_slot_0 : graph_start_slot_1;
         UIPC_ASSERT(graph, "LinearFusedPCG has no CUDA Graph for starting slot {}.", completed & 1);
         {
-            muda::RangeName range{"libuipc/PCG/graph/launch"};
+            PcgNvtxRange range{"libuipc/PCG/graph/launch"};
             checkCudaErrors(cudaGraphLaunch(graph, stream));
         }
         {
-            muda::RangeName range{"libuipc/PCG/graph/check_state_D2H"};
+            PcgNvtxRange range{"libuipc/PCG/graph/check_state_D2H"};
             checkCudaErrors(cudaMemcpyAsync(
                 &check_state, d_check_state.data(), sizeof(check_state), cudaMemcpyDeviceToHost, stream));
             checkCudaErrors(cudaStreamSynchronize(stream));
