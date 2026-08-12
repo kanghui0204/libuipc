@@ -130,3 +130,51 @@ bounds and require exact status and terminal-iteration results. End-to-end
 contact trajectories must also be compared with the repeatability envelope of
 the unchanged solver because the existing assembly and reduction path is not
 bitwise deterministic.
+
+## Validation on the G2 fold-paper replay
+
+The production validation used an NVIDIA L20, the complete 1,741-frame G2
+dual-arm fold-paper MCAP replay, `paper_dim=32`, and a fresh process and World
+for every run. `World::advance()` was measured without Nsight Systems and
+without rendering.
+
+| Mode | Implementation | Check interval | Mean | Median | P95 |
+|---|---|---:|---:|---:|---:|
+| A5 run 1 | legacy | 5 | 182.930 ms | 134.217 ms | 416.579 ms |
+| A5 run 2 | legacy | 5 | 176.146 ms | 127.447 ms | 391.281 ms |
+| B5 | Graph and fused kernels | 5 | 112.070 ms | 79.253 ms | 257.854 ms |
+| B10 run 1 | Graph and fused kernels | 10 | 112.821 ms | 77.713 ms | 271.522 ms |
+| B10 run 2 | Graph and fused kernels | 10 | 109.926 ms | 75.948 ms | 256.474 ms |
+
+The two-run A5 mean compared with the two-run B10 mean decreased by 37.97%.
+Keeping the interval at five, B5 decreased the mean by 37.58%, while changing
+the optimized implementation from interval five to ten provided only another
+0.62% mean reduction in this replay. Most of the measured improvement therefore
+comes from Graph submission and kernel fusion, not from relaxing the host-check
+frequency.
+
+The maximum single-frame time is intentionally not used as the primary result:
+A5 repeated maxima were 748.93 and 869.11 ms, while B10 repeated maxima were
+743.50 and 490.06 ms. The B10 743.50 ms event was frame 141, not Graph creation.
+A dedicated startup Nsight Systems capture measured the one-time Graph rebuild
+at 0.809 ms in frame 0.
+
+In the same fixed heavy 50-frame window, Nsight Systems measured:
+
+| Diagnostic total | A5 | B10 | Change |
+|---|---:|---:|---:|
+| CUDA Runtime API calls | 3,775,615 | 333,839 | -91.16% |
+| all GPU kernel calls | 2,939,070 | 2,079,821 | -29.24% |
+| core PCG kernel time | 7.735 s | 4.935 s | -36.20% |
+| 8-byte device memsets | 624,562 | 2,638 | -99.58% |
+
+The profiler materially increases host/API timings, so those values diagnose
+submission and GPU work and are not customer FPS measurements.
+
+The final CUDA test gate exercised 13 fused-PCG cases with 8,163,180
+assertions. Additional tests covered actual ABD/FEM preconditioners for 1/5/10
+iterations, 1,000 random logical-count changes in one Graph, real matrix and
+vector reallocations followed by Graph rebuild, 1,000 resets of one Graph
+executable, two independent Graph executables interleaved 1,000 times,
+non-finite/breakdown reset recovery, unsupported-preconditioner fallback, and
+Compute Sanitizer memory and leak checks.
