@@ -82,6 +82,7 @@ void LinearPCG::do_solve(GlobalLinearSystem::SolvingInfo& info)
             max_iter);
 
     info.iter_count(iter);
+    info.effective_iter_count(iter);
 }
 
 void LinearPCG::dump_r_z(SizeT k)

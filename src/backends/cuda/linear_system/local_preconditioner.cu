@@ -31,6 +31,11 @@ void LocalPreconditioner::apply(GlobalLinearSystem::ApplyPreconditionerInfo& inf
     do_apply(info);
 }
 
+void LocalPreconditioner::do_fused_pcg_apply(GlobalLinearSystem::FusedPcgIterationInfo&)
+{
+    UIPC_ASSERT(false, "{} does not implement the fused PCG iteration path.", name());
+}
+
 void LocalPreconditioner::BuildInfo::connect(DiagLinearSubsystem* system)
 {
     m_subsystem = system;

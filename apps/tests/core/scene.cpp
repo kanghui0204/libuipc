@@ -402,3 +402,24 @@ TEST_CASE("dynamic_dt_config", "[scene]")
         REQUIRE(visitor.dt() == Catch::Approx(0.02));
     }
 }
+
+TEST_CASE("fused_pcg_defaults_preserve_legacy_execution", "[scene][fused_pcg]")
+{
+    using namespace uipc;
+    using namespace uipc::core;
+
+    Scene scene;
+
+    const auto check_interval = scene.config().find<IndexT>("linear_system/check_interval");
+    const auto graph_enable =
+        scene.config().find<IndexT>("linear_system/fused_pcg/graph_enable");
+    const auto fused_preconditioner_enable =
+        scene.config().find<IndexT>("linear_system/fused_pcg/fused_preconditioner_enable");
+
+    REQUIRE(check_interval != nullptr);
+    REQUIRE(graph_enable != nullptr);
+    REQUIRE(fused_preconditioner_enable != nullptr);
+    REQUIRE(check_interval->view()[0] == 5);
+    REQUIRE(graph_enable->view()[0] == 0);
+    REQUIRE(fused_preconditioner_enable->view()[0] == 1);
+}

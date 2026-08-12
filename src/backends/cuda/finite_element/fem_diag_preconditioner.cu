@@ -8,6 +8,7 @@
 #include <kernel_cout.h>
 #include <muda/ext/eigen/log_proxy.h>
 #include <uipc/geometry/simplicial_complex.h>
+#include <linear_system/fused_pcg_kernels.h>
 
 namespace uipc::backend::cuda
 {
@@ -88,22 +89,34 @@ class FEMDiagPreconditioner : public LocalPreconditioner
 
     virtual void do_apply(GlobalLinearSystem::ApplyPreconditionerInfo& info) override
     {
-        using namespace muda;
-        auto converged = info.converged();
+        launch_fem_diag_preconditioner_apply(
+            diag_inv.view(), info.r(), info.z(), info.converged());
+    }
 
-        ParallelFor()
-            .file_line(__FILE__, __LINE__)
-            .apply(diag_inv.size(),
-                   [r = info.r().viewer().name("r"),
-                    z = info.z().viewer().name("z"),
-                    converged = converged.cviewer().name("converged"),
-                    diag_inv = diag_inv.viewer().name("diag_inv")] __device__(int i) mutable
-                   {
-                       if(*converged != 0)
-                           return;
-                       z.segment<3>(i * 3).as_eigen() =
-                           diag_inv(i) * r.segment<3>(i * 3).as_eigen();
-                   });
+    virtual bool do_supports_fused_pcg() const override { return true; }
+
+    virtual SizeT do_fused_pcg_signature() const override
+    {
+        constexpr SizeT Kind = 0x46454d5f504347ull;
+        SizeT           seed = reinterpret_cast<SizeT>(diag_inv.data());
+        seed ^= static_cast<SizeT>(diag_inv.size()) + Kind + (seed << 6) + (seed >> 2);
+        return seed;
+    }
+
+    virtual void do_fused_pcg_apply(GlobalLinearSystem::FusedPcgIterationInfo& info) override
+    {
+        launch_fused_pcg_fem_update_apply_dot(diag_inv.view(),
+                                              info.x(),
+                                              info.p(),
+                                              info.r(),
+                                              info.Ap(),
+                                              info.z(),
+                                              info.alpha(),
+                                              info.rz_new(),
+                                              info.status(),
+                                              info.params(),
+                                              info.iteration_in_chunk(),
+                                              info.stream());
     }
 };
 
