@@ -82,6 +82,7 @@ void LinearPCG::do_solve(GlobalLinearSystem::SolvingInfo& info)
             max_iter);
 
     info.iter_count(iter);
+    info.effective_iter_count(iter);
 }
 
 void LinearPCG::dump_r_z(SizeT k)
@@ -160,9 +161,9 @@ void LinearPCG::check_iter_rz_nan_inf(Float rz, SizeT k)
         auto norm_z = ctx().norm(z.cview());
         bool r_ok   = std::isfinite(norm_r);
         bool z_bad  = !std::isfinite(norm_z);
-        auto hint = (r_ok && z_bad) ?
-                        "preconditioner failed, likely due to inverse matrix calculation failure" :
-                        "PCG iteration diverged";
+        auto hint   = (r_ok && z_bad) ?
+                          "preconditioner failed, likely due to inverse matrix calculation failure" :
+                          "PCG iteration diverged";
         UIPC_ASSERT(false,
                     "Frame {}, Newton {}, PCG Iter {}: r^T*z = {}, norm(r) = {}, norm(z) = {}. "
                     "Hint: {}.",

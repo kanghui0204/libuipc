@@ -41,4 +41,5 @@
 - [Development](development/index.md)
     - [Backend](development/backend.md)
     - [Backend Cuda](development/backend_cuda/index.md)
+        - [Fused PCG CUDA Graph](development/backend_cuda/linear_fused_pcg_graph.md)
 - [Misc](misc/)

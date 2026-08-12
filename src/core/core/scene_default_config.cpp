@@ -25,6 +25,9 @@ geometry::AttributeCollection default_scene_config() noexcept
     config.create("newton/semi_implicit/beta_tol", Float{1e-3});
 
     config.create("linear_system/tol_rate", Float{1e-3});
+    config.create("linear_system/check_interval", IndexT{10});
+    config.create("linear_system/fused_pcg/graph_enable", IndexT{1});
+    config.create("linear_system/fused_pcg/fused_preconditioner_enable", IndexT{1});
 
     // default:
     //  - fused_pcg
@@ -41,7 +44,7 @@ geometry::AttributeCollection default_scene_config() noexcept
     config.create("contact/friction/enable", IndexT{1});
     // friction transition velocity
     config.create("contact/eps_velocity", Float{0.01_m / 1.0_s});
-    
+
     // default:
     //  - ipc
     // or:
@@ -60,7 +63,6 @@ geometry::AttributeCollection default_scene_config() noexcept
     config.create("contact/adaptive/init_kappa", Float{1.0_GPa});
     config.create("contact/adaptive/max_kappa", Float{100.0_GPa});
 
-    
 
     // default:
     //  - info_stackless_bvh
