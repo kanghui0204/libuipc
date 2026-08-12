@@ -1,4 +1,5 @@
 #include <linear_system/global_linear_system.h>
+#include <linear_system/fused_pcg_kernels.h>
 #include <linear_system/diag_linear_subsystem.h>
 #include <linear_system/off_diag_linear_subsystem.h>
 #include <uipc/common/range.h>
@@ -431,6 +432,9 @@ void GlobalLinearSystem::Impl::solve_linear_system()
         info.m_x = x.view();
         iterative_solver->solve(info);
         logger::info("Iterative linear solver iteration count: {}", info.m_iter_count);
+        if(info.m_effective_iter_count != info.m_iter_count)
+            logger::debug("Iterative linear solver effective iteration count: {}",
+                          info.m_effective_iter_count);
     }
 }
 
@@ -492,6 +496,117 @@ void GlobalLinearSystem::Impl::apply_preconditioner(muda::DenseVectorView<Float>
     }
 }
 
+bool GlobalLinearSystem::Impl::supports_fused_pcg() const
+{
+    if(global_preconditioner)
+        return false;
+
+    std::vector<SizeT> connected_counts(diag_subsystems.view().size(), 0);
+    for(const auto* preconditioner : local_preconditioners.view())
+    {
+        const auto index = preconditioner->m_subsystem->m_index;
+        if(++connected_counts[index] != 1)
+            return false;
+    }
+
+    for(auto index : no_precond_diag_subsystem_indices)
+        if(connected_counts[index] != 0)
+            return false;
+
+    return std::ranges::all_of(local_preconditioners.view(),
+                               [](const LocalPreconditioner* preconditioner)
+                               { return preconditioner->supports_fused_pcg(); });
+}
+
+SizeT GlobalLinearSystem::Impl::fused_pcg_preconditioner_signature() const
+{
+    constexpr SizeT HashMix = 0x9e3779b97f4a7c15ull;
+    SizeT      seed = static_cast<SizeT>(local_preconditioners.view().size());
+    const auto mix  = [&seed](SizeT value)
+    { seed ^= value + HashMix + (seed << 6) + (seed >> 2); };
+
+    const auto offsets = diag_dof_offsets_counts.offsets();
+    const auto counts  = diag_dof_offsets_counts.counts();
+    mix(static_cast<SizeT>(counts.size()));
+    for(SizeT index = 0; index < counts.size(); ++index)
+    {
+        mix(index);
+        mix(static_cast<SizeT>(offsets[index]));
+        mix(static_cast<SizeT>(counts[index]));
+    }
+
+    mix(static_cast<SizeT>(no_precond_diag_subsystem_indices.size()));
+    for(const auto index : no_precond_diag_subsystem_indices)
+        mix(static_cast<SizeT>(index));
+
+    for(const auto* preconditioner : local_preconditioners.view())
+    {
+        const auto index = preconditioner->m_subsystem->m_index;
+        const auto value = preconditioner->fused_pcg_signature();
+        mix(static_cast<SizeT>(index));
+        mix(value);
+    }
+    return seed;
+}
+
+void GlobalLinearSystem::Impl::fused_pcg_update_apply_dot(
+    muda::DenseVectorView<Float>         x,
+    muda::CDenseVectorView<Float>        p,
+    muda::DenseVectorView<Float>         r,
+    muda::CDenseVectorView<Float>        Ap,
+    muda::DenseVectorView<Float>         z,
+    muda::CVarView<Float>                rz_old,
+    muda::CVarView<Float>                pAp,
+    muda::VarView<Float>                 rz_new,
+    muda::CVarView<IndexT>               status,
+    muda::CVarView<FusedPcgDeviceParams> params,
+    IndexT                               iteration_in_chunk,
+    cudaStream_t                         stream)
+{
+    auto diag_dof_counts  = diag_dof_offsets_counts.counts();
+    auto diag_dof_offsets = diag_dof_offsets_counts.offsets();
+
+    for(auto* preconditioner : local_preconditioners.view())
+    {
+        const auto index  = preconditioner->m_subsystem->m_index;
+        const auto offset = diag_dof_offsets[index];
+        const auto count  = diag_dof_counts[index];
+
+        FusedPcgIterationInfo info{this};
+        info.m_x                  = x.subview(offset, count);
+        info.m_p                  = p.subview(offset, count);
+        info.m_r                  = r.subview(offset, count);
+        info.m_Ap                 = Ap.subview(offset, count);
+        info.m_z                  = z.subview(offset, count);
+        info.m_rz_old             = rz_old;
+        info.m_pAp                = pAp;
+        info.m_rz_new             = rz_new;
+        info.m_status             = status;
+        info.m_params             = params;
+        info.m_iteration_in_chunk = iteration_in_chunk;
+        info.m_stream             = stream;
+        preconditioner->apply_fused_pcg(info);
+    }
+
+    for(auto index : no_precond_diag_subsystem_indices)
+    {
+        const auto offset = diag_dof_offsets[index];
+        const auto count  = diag_dof_counts[index];
+        launch_fused_pcg_identity_update_apply_dot(x.subview(offset, count),
+                                                   p.subview(offset, count),
+                                                   r.subview(offset, count),
+                                                   Ap.subview(offset, count),
+                                                   z.subview(offset, count),
+                                                   rz_old,
+                                                   pAp,
+                                                   rz_new,
+                                                   status,
+                                                   params,
+                                                   iteration_in_chunk,
+                                                   stream);
+    }
+}
+
 void GlobalLinearSystem::Impl::spmv(Float                         a,
                                     muda::CDenseVectorView<Float> x,
                                     Float                         b,
@@ -509,6 +624,18 @@ void GlobalLinearSystem::Impl::spmv_dot(muda::CDenseVectorView<Float> x,
                                         muda::VarView<Float>          d_dot)
 {
     spmver.rbk_sym_spmv_dot(1.0, bcoo_A.cview(), x, 0.0, y, d_dot);
+}
+
+GlobalLinearSystem::CBCOOMatrixView GlobalLinearSystem::Impl::fused_pcg_matrix_capacity_view() const
+{
+    using View         = GlobalLinearSystem::CBCOOMatrixView;
+    const int capacity = static_cast<int>(bcoo_A.triplet_capacity());
+    return View{bcoo_A.rows(),
+                bcoo_A.cols(),
+                capacity,
+                bcoo_A.row_indices().data(),
+                bcoo_A.col_indices().data(),
+                bcoo_A.values().data()};
 }
 
 bool GlobalLinearSystem::Impl::accuracy_statisfied(muda::DenseVectorView<Float> r)

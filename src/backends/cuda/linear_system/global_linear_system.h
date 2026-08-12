@@ -8,6 +8,7 @@
 #include <linear_system/spmv.h>
 #include <utils/offset_count_collection.h>
 #include <energy_component_flags.h>
+#include <linear_system/fused_pcg_common.h>
 namespace uipc::backend::cuda
 {
 // Define a simple POD to avoid constructing CUDA's built-in vector type with pmr allocators in host code
@@ -200,6 +201,44 @@ class GlobalLinearSystem : public SimSystem
         Impl*            m_impl = nullptr;
     };
 
+    class FusedPcgIterationInfo
+    {
+      public:
+        FusedPcgIterationInfo(Impl* impl) noexcept
+            : m_impl(impl)
+        {
+        }
+
+        DenseVectorView                      x() { return m_x; }
+        CDenseVectorView                     p() { return m_p; }
+        DenseVectorView                      r() { return m_r; }
+        CDenseVectorView                     Ap() { return m_Ap; }
+        DenseVectorView                      z() { return m_z; }
+        muda::CVarView<Float>                rz_old() { return m_rz_old; }
+        muda::CVarView<Float>                pAp() { return m_pAp; }
+        muda::VarView<Float>                 rz_new() { return m_rz_new; }
+        muda::CVarView<IndexT>               status() { return m_status; }
+        muda::CVarView<FusedPcgDeviceParams> params() { return m_params; }
+        IndexT       iteration_in_chunk() const { return m_iteration_in_chunk; }
+        cudaStream_t stream() const { return m_stream; }
+
+      private:
+        friend class Impl;
+        DenseVectorView                      m_x;
+        CDenseVectorView                     m_p;
+        DenseVectorView                      m_r;
+        CDenseVectorView                     m_Ap;
+        DenseVectorView                      m_z;
+        muda::CVarView<Float>                m_rz_old;
+        muda::CVarView<Float>                m_pAp;
+        muda::VarView<Float>                 m_rz_new;
+        muda::CVarView<IndexT>               m_status;
+        muda::CVarView<FusedPcgDeviceParams> m_params;
+        IndexT                               m_iteration_in_chunk = 0;
+        cudaStream_t                         m_stream             = nullptr;
+        Impl*                                m_impl               = nullptr;
+    };
+
     class AccuracyInfo
     {
       public:
@@ -230,13 +269,18 @@ class GlobalLinearSystem : public SimSystem
         DenseVectorView  x() { return m_x; }
         CDenseVectorView b() { return m_b; }
         void iter_count(SizeT iter_count) { m_iter_count = iter_count; }
+        void             effective_iter_count(SizeT iter_count)
+        {
+            m_effective_iter_count = iter_count;
+        }
 
       private:
         friend class Impl;
         DenseVectorView  m_x;
         CDenseVectorView m_b;
-        SizeT            m_iter_count = 0;
-        Impl*            m_impl       = nullptr;
+        SizeT            m_iter_count           = 0;
+        SizeT            m_effective_iter_count = 0;
+        Impl*            m_impl                 = nullptr;
     };
 
     class SolutionInfo
@@ -317,10 +361,26 @@ class GlobalLinearSystem : public SimSystem
                                   muda::CDenseVectorView<Float> r,
                                   muda::CVarView<IndexT>        converged);
 
+        bool  supports_fused_pcg() const;
+        SizeT fused_pcg_preconditioner_signature() const;
+        void  fused_pcg_update_apply_dot(muda::DenseVectorView<Float>  x,
+                                         muda::CDenseVectorView<Float> p,
+                                         muda::DenseVectorView<Float>  r,
+                                         muda::CDenseVectorView<Float> Ap,
+                                         muda::DenseVectorView<Float>  z,
+                                         muda::CVarView<Float>         rz_old,
+                                         muda::CVarView<Float>         pAp,
+                                         muda::VarView<Float>          rz_new,
+                                         muda::CVarView<IndexT>        status,
+                                         muda::CVarView<FusedPcgDeviceParams> params,
+                                         IndexT       iteration_in_chunk,
+                                         cudaStream_t stream);
+
         void spmv(Float a, muda::CDenseVectorView<Float> x, Float b, muda::DenseVectorView<Float> y);
         void spmv_dot(muda::CDenseVectorView<Float> x,
                       muda::DenseVectorView<Float>  y,
                       muda::VarView<Float>          d_dot);
+        CBCOOMatrixView fused_pcg_matrix_capacity_view() const;
 
         bool accuracy_statisfied(muda::DenseVectorView<Float> r);
         void compute_gradient(ComputeGradientInfo& info);

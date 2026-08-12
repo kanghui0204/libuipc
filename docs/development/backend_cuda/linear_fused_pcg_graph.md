@@ -1,0 +1,157 @@
+# Fused PCG CUDA Graph
+
+This document describes the CUDA Graph fast path in `LinearFusedPCG` and the
+contracts that must remain true when it is changed.
+
+## Scope
+
+The optimization covers only the inner preconditioned conjugate-gradient
+(PCG) solve. Matrix assembly, contact detection, Newton control, continuous
+collision detection, and line search remain outside the Graph.
+
+One Graph chunk contains `linear_system/check_interval` PCG iterations. The
+default remains five for compatibility, and Graph execution is opt-in. An even
+interval returns to the same ping-pong slot after every
+chunk, so one Graph executable is sufficient. An odd interval swaps the slot
+parity, so two mirror Graph executables are used alternately.
+
+## One captured iteration
+
+Each captured iteration performs:
+
+```text
+pipelined symmetric block SpMV
+  -> Ap = A * p
+  -> pAp = p^T * A * p
+  -> clear the inactive Ap/pAp slot for the next iteration
+
+fused local update and preconditioner apply
+  -> each worker computes alpha = rz_old / pAp
+  -> x = x + alpha * p
+  -> r = r - alpha * Ap
+  -> z = P^-1 * r
+  -> accumulate rz_new = r^T * z
+
+update convergence
+  -> apply the same residual convergence test as the legacy solver
+  -> set Running or Converged
+  -> record the first terminal iteration in fixed device state
+
+update search direction and prepare the next slot
+  -> p = z + (rz_new / rz_old) * p
+  -> publish rz_new as the next iteration's rz_old
+  -> clear the next rz_new slot
+```
+
+This is five kernels for an ABD-plus-FEM iteration: SpMV, fused ABD,
+fused FEM, convergence, and search-direction update. There is no separate
+alpha buffer or alpha-preparation kernel. During the fused update kernels,
+`status`, `rz_old`, and `pAp` are read-only; each worker computes the same
+`alpha = rz_old / pAp` before changing its vector entries. The optimization
+does not add a new curvature or denominator policy: non-finite residuals are
+reported at the same Host check boundary as the legacy solver.
+
+The scalar and vector ping-pong buffers remove separate per-iteration clear and
+copy operations between these stages. The inactive buffers are still initialized
+inside the pipelined kernels before they are reused.
+
+## Dynamic matrix sizes
+
+The Graph does not assume a fixed matrix size or a fixed set of contact
+blocks. It separates launch capacity from logical work:
+
+- `triplet_bucket` determines the captured grid size;
+- `FusedPcgDeviceParams::triplet_count` is the exact number of valid 3x3
+  sparse blocks for the current Newton system;
+- each extra thread checks the device count and performs no matrix access;
+- matrix values and indices may be overwritten between Graph launches.
+
+The launch bucket is rounded upward and only grows while the backing matrix
+allocation is unchanged. Therefore a small count change does not require ten
+`cudaGraphExecKernelNodeSetParams` calls for a ten-iteration Graph.
+
+This does not make pointer changes safe automatically. The Graph signature
+tracks the matrix arrays, PCG vectors and scalars, device metadata, local
+preconditioner buffers and layout, scalar degree-of-freedom count, launch
+bucket, and check interval. Any captured binding change invalidates the Graph
+and triggers a slow-path rebuild before the next launch.
+
+## Convergence and compatibility
+
+The device checks every iteration. Once a terminal state is recorded, later
+nodes in the static chunk return without changing `x`, `r`, `z`, `p`, or
+advancing the `rz_old`/`rz_new` ping-pong slots.
+The fixed `FusedPcgCheckState` retains the first terminal iteration and its
+residual so the host does not have to infer which ping-pong slot is current.
+
+The public iteration count retains the legacy host-check convention. For
+example, if the numerical state converges at iteration 3 with a check interval
+of 10, the terminal iteration is 3 and the reported iteration is 10. This
+preserves existing timing and diagnostic semantics while exposing the more
+precise device result internally.
+
+If the solve reaches its iteration budget without a terminal state, the
+reported count keeps the legacy `max_iter` value, the effective count records
+the `max_iter - 1` iterations that actually executed, and the terminal
+iteration remains unset.
+
+Non-finite `r^T z` is checked on the Host after each Graph chunk, matching the
+legacy check interval. This performance path intentionally does not introduce
+a new `p^T A p` sign test or recovery policy.
+
+## Configuration
+
+| Scene configuration key | Default | Effect |
+|---|---:|---|
+| `linear_system/check_interval` | `5` | Captured iterations and host-check interval. The Graph path requires a value from 1 to 1024; the legacy path retains its existing behavior for older configurations. |
+| `linear_system/fused_pcg/graph_enable` | `0` | Enables Graph execution when the solver layout is supported. |
+| `linear_system/fused_pcg/fused_preconditioner_enable` | `1` | Enables the fused local update/apply/dot kernels. Disabling it currently selects the legacy solver path. |
+
+For example, an application can explicitly enable a ten-iteration Graph chunk:
+
+```cpp
+auto check_interval =
+    scene.config().find<IndexT>("linear_system/check_interval");
+auto graph_enable =
+    scene.config().find<IndexT>("linear_system/fused_pcg/graph_enable");
+uipc::geometry::view(*check_interval)[0] = 10;
+uipc::geometry::view(*graph_enable)[0]   = 1;
+```
+
+Unsupported global preconditioners, unsupported local preconditioners, or an
+ambiguous local-preconditioner layout use the legacy path. This is a required
+correctness fallback, not an error.
+
+## Lifetime and ownership
+
+Each `LinearFusedPCG` instance owns its Graph executables and private
+non-blocking capture stream. Graph objects are destroyed by the solver
+destructor. Different solver or World instances must not mutate and share the
+same executable Graph.
+
+The captured Graph is launched on the solver's execution stream after matrix
+and preconditioner assembly. If assembly and solve are moved to different
+streams in the future, an event dependency must be added before the Graph
+launch.
+
+## Required tests
+
+Changes to this path must test:
+
+- sequential iteration, Graph with interval 5, and Graph with interval 10 on
+  the same fixed sparse system;
+- one, five, and ten forced iterations;
+- convergence at every position inside a static Graph chunk;
+- non-finite residual reporting at the Host check boundary;
+- logical block-count changes that remain inside one launch bucket;
+- matrix, vector, preconditioner, and device-metadata pointer changes;
+- bucket growth, Graph rebuild, destruction, and multiple independent Worlds;
+- FEM-only, ABD-only, FEM-ABD contact, articulation constraints, plastic
+  cloth, dynamic time step, and recovery integration paths.
+
+Floating-point reductions use atomic additions, so bitwise equality is not a
+portable contract. Fixed-system tests use strict absolute and relative error
+bounds and require exact status and terminal-iteration results. End-to-end
+contact trajectories must also be compared with the repeatability envelope of
+the unchanged solver because the existing assembly and reduction path is not
+bitwise deterministic.

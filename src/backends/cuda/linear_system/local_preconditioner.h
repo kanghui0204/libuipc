@@ -31,6 +31,9 @@ class LocalPreconditioner : public SimSystem
     virtual void do_init(InitInfo& info)   = 0;
     virtual void do_assemble(GlobalLinearSystem::LocalPreconditionerAssemblyInfo& info) = 0;
     virtual void do_apply(GlobalLinearSystem::ApplyPreconditionerInfo& info) = 0;
+    virtual bool  do_supports_fused_pcg() const { return false; }
+    virtual SizeT do_fused_pcg_signature() const { return 0; }
+    virtual void do_fused_pcg_apply(GlobalLinearSystem::FusedPcgIterationInfo& info);
 
   private:
     friend class GlobalLinearSystem;
@@ -38,8 +41,14 @@ class LocalPreconditioner : public SimSystem
     virtual void do_build() final override;
     virtual void init();
 
-    void assemble(GlobalLinearSystem::LocalPreconditionerAssemblyInfo& info);
-    void apply(GlobalLinearSystem::ApplyPreconditionerInfo& info);
+    void  assemble(GlobalLinearSystem::LocalPreconditionerAssemblyInfo& info);
+    void  apply(GlobalLinearSystem::ApplyPreconditionerInfo& info);
+    bool  supports_fused_pcg() const { return do_supports_fused_pcg(); }
+    SizeT fused_pcg_signature() const { return do_fused_pcg_signature(); }
+    void  apply_fused_pcg(GlobalLinearSystem::FusedPcgIterationInfo& info)
+    {
+        do_fused_pcg_apply(info);
+    }
     DiagLinearSubsystem* m_subsystem = nullptr;
 };
 }  // namespace uipc::backend::cuda
