@@ -25,6 +25,9 @@ geometry::AttributeCollection default_scene_config() noexcept
     config.create("newton/semi_implicit/beta_tol", Float{1e-3});
 
     config.create("linear_system/tol_rate", Float{1e-3});
+    config.create("linear_system/check_interval", IndexT{5});
+    config.create("linear_system/fused_pcg/graph_enable", IndexT{0});
+    config.create("linear_system/fused_pcg/fused_preconditioner_enable", IndexT{1});
 
     // default:
     //  - fused_pcg
