@@ -18,9 +18,19 @@ TEST_CASE("49_abd_adaptive_kappa", "[abd]")
     Engine engine{"cuda", output_path};
     World  world{engine};
 
+    Float friction_rate = 0.0;
+    SECTION("friction-off")
+    {
+        friction_rate = 0.0;
+    }
+    SECTION("friction-on")
+    {
+        friction_rate = 0.5;
+    }
+
     auto config                             = test::Scene::default_config();
     config["gravity"]                       = Vector3{0, -9.8, 0};
-    config["contact"]["friction"]["enable"] = false;
+    config["contact"]["friction"]["enable"] = friction_rate > 0.0;
     config["line_search"]["report_energy"]  = true;
     test::Scene::dump_config(config, output_path);
 
@@ -28,7 +38,7 @@ TEST_CASE("49_abd_adaptive_kappa", "[abd]")
     {
         // create constitution and contact model
         AffineBodyConstitution abd;
-        scene.contact_tabular().default_model(0, builtin::adaptive);
+        scene.contact_tabular().default_model(friction_rate, builtin::adaptive);
         auto default_contact = scene.contact_tabular().default_element();
 
         // create object
