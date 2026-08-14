@@ -8,6 +8,20 @@ namespace uipc::backend::cuda
 namespace sym::codim_ipc_contact
 {
 
+    template <typename Hessian, int N>
+    inline __device__ void lift_friction_hessian(Hessian&                   H,
+                                                 const Matrix<Float, 2, N>& J,
+                                                 const Matrix2x2&           H2x2,
+                                                 Float signed_scale)
+    {
+        // The legacy full-H PSD projection mapped an invalid negative
+        // friction scale to zero while preserving its signed gradient.
+        if(signed_scale < 0.0)
+            H.setZero();
+        else
+            H = J.transpose() * H2x2 * J;
+    }
+
     inline __device__ ContactCoeff PT_contact_coeff(const muda::CDense2D<ContactCoeff>& table,
                                                     const Vector4i& cids)
     {
@@ -199,7 +213,7 @@ namespace sym::codim_ipc_contact
 
         Matrix2x2 H2x2;
         friction_hessian(H2x2, mu, f, eps_vh, tan_rel_dx);
-        H = J.transpose() * H2x2 * J;
+        lift_friction_hessian(H, J, H2x2, mu * f);
     }
 
     inline __device__ void PT_friction_gradient(Vector12&    G,
@@ -388,7 +402,7 @@ namespace sym::codim_ipc_contact
 
         Matrix2x2 H2x2;
         friction_hessian(H2x2, mu, f, eps_vh, tan_rel_dx);
-        H = J.transpose() * H2x2 * J;
+        lift_friction_hessian(H, J, H2x2, mu * f);
     }
 
     inline __device__ void EE_friction_gradient(Vector12&    G,
@@ -569,7 +583,7 @@ namespace sym::codim_ipc_contact
 
         Matrix2x2 H2x2;
         friction_hessian(H2x2, mu, f, eps_vh, tan_rel_dx);
-        H = J.transpose() * H2x2 * J;
+        lift_friction_hessian(H, J, H2x2, mu * f);
     }
 
     inline __device__ void PE_friction_gradient(Vector9&   G,
@@ -729,7 +743,7 @@ namespace sym::codim_ipc_contact
 
         Matrix2x2 H2x2;
         friction_hessian(H2x2, mu, f, eps_vh, tan_rel_dx);
-        H = J.transpose() * H2x2 * J;
+        lift_friction_hessian(H, J, H2x2, mu * f);
     }
 
     inline __device__ void PP_friction_gradient(Vector6&   G,
