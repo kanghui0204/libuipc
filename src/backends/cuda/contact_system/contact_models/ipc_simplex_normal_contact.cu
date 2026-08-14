@@ -4,6 +4,7 @@
 #include <utils/codim_thickness.h>
 #include <kernel_cout.h>
 #include <utils/matrix_assembler.h>
+#include <utils/four_vertex_translation_free_spd.h>
 #include <utils/make_spd.h>
 #include <utils/fixed_bank_soa_evd.h>
 #include <utils/contact_type_block_layout.h>
@@ -373,7 +374,8 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                             Vector12 eigen_values;
                             PT_barrier_gradient_hessian(
                                 G, H, flag, kt2, d_hat, thickness, P, T0, T1, T2);
-                            selfadjoint_evd_fixed_bank_shared<12>(H, eigen_values);
+                            selfadjoint_evd_four_vertex_translation_free_fixed_bank<
+                                SharedLanePitch>(H, eigen_values);
                             DoubletVectorAssembler DVA{PT_Gs};
                             DVA.segment<4>(i * 4).write(PT, G);
                             TripletMatrixAssembler TMA{PT_Hs};
@@ -427,7 +429,8 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                             Vector12 eigen_values;
                             mollified_EE_barrier_gradient_hessian(
                                 G, H, flag, kt2, d_hat, thickness, t0_Ea0, t0_Ea1, t0_Eb0, t0_Eb1, E0, E1, E2, E3);
-                            selfadjoint_evd_fixed_bank_shared<12>(H, eigen_values);
+                            selfadjoint_evd_four_vertex_translation_free_fixed_bank<
+                                SharedLanePitch>(H, eigen_values);
                             DoubletVectorAssembler DVA{EE_Gs};
                             DVA.segment<4>(i * 4).write(EE, G);
                             TripletMatrixAssembler TMA{EE_Hs};
