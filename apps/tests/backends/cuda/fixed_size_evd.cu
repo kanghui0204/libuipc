@@ -1,6 +1,7 @@
 #include <app/app.h>
 
 #include <utils/fixed_bank_soa_evd.h>
+#include <utils/contact_type_block_layout.h>
 
 #include <muda/check/check_cuda_errors.h>
 #include <Eigen/Eigenvalues>
@@ -235,4 +236,63 @@ TEST_CASE("fixed-size shared EVD matches CPU Eigen", "[fixed_size_evd]")
     run_fixed_size_evd_test<6>();
     run_fixed_size_evd_test<9>();
     run_fixed_size_evd_test<12>();
+}
+
+template <int BlockSize>
+void check_contact_type_block_layout()
+{
+    for(int pt_count = 0; pt_count <= 2 * BlockSize; ++pt_count)
+    {
+        for(int ee_count = 0; ee_count <= 2 * BlockSize; ++ee_count)
+        {
+            for(int pe_count = 0; pe_count <= 2 * BlockSize; ++pe_count)
+            {
+                for(int pp_count = 0; pp_count <= 2 * BlockSize; ++pp_count)
+                {
+                    const auto layout = make_contact_type_block_layout<BlockSize>(
+                        pt_count, ee_count, pe_count, pp_count);
+                    REQUIRE(layout.pt_end == pt_count);
+                    REQUIRE(layout.ee_end - layout.ee_offset == ee_count);
+                    REQUIRE(layout.pe_end - layout.pe_offset == pe_count);
+                    REQUIRE(layout.padded_total - layout.pp_offset == pp_count);
+                    REQUIRE(layout.ee_offset % BlockSize == 0);
+                    REQUIRE(layout.pe_offset % BlockSize == 0);
+                    REQUIRE(layout.pp_offset % BlockSize == 0);
+
+                    for(int block_begin = 0; block_begin < layout.padded_total;
+                        block_begin += BlockSize)
+                    {
+                        int block_type = -1;
+                        for(int idx = block_begin;
+                            idx < block_begin + BlockSize && idx < layout.padded_total;
+                            ++idx)
+                        {
+                            int type = -1;
+                            if(idx < layout.pt_end)
+                                type = 0;
+                            else if(idx >= layout.ee_offset && idx < layout.ee_end)
+                                type = 1;
+                            else if(idx >= layout.pe_offset && idx < layout.pe_end)
+                                type = 2;
+                            else if(idx >= layout.pp_offset)
+                                type = 3;
+
+                            if(type >= 0)
+                            {
+                                if(block_type < 0)
+                                    block_type = type;
+                                REQUIRE(type == block_type);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("contact types never share a padded block", "[contact_block_padding]")
+{
+    check_contact_type_block_layout<8>();
+    check_contact_type_block_layout<12>();
 }
