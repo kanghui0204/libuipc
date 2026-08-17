@@ -6,6 +6,7 @@
 #include <muda/ext/linear_system/dense_vector_view.h>
 #include <muda/ext/linear_system/device_dense_vector.h>
 #include <muda/buffer/var_view.h>
+#include <linear_system/fused_pcg_common.h>
 
 namespace uipc::backend::cuda
 {
@@ -42,6 +43,18 @@ class Spmv
                           Float                           b,
                           muda::DenseVectorView<Float>    y,
                           muda::VarView<Float>            d_dot);
+
+    void rbk_sym_spmv_dot_pipelined(muda::CBCOOMatrixView<Float, 3> A,
+                                    muda::CDenseVectorView<Float>   x,
+                                    muda::DenseVectorView<Float>    y,
+                                    muda::VarView<Float>            d_dot,
+                                    muda::DenseVectorView<Float>    next_y,
+                                    muda::VarView<Float>            next_dot,
+                                    muda::CVarView<IndexT>          status,
+                                    muda::CVarView<FusedPcgDeviceParams> params,
+                                    IndexT       iteration_in_chunk,
+                                    SizeT        triplet_bucket,
+                                    cudaStream_t stream);
 
     // debug fallback cpu spmv
     // very slow, only for debug

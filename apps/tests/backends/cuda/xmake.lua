@@ -3,6 +3,7 @@ target("backend_cuda")
     add_rules("uipc_test")
     add_deps("cuda")
     add_files("**.cu")
+    add_includedirs(path.join(os.scriptdir(), "../../../..", "src"))
     if has_config("dev") then
         add_rules("clangd")
     end
