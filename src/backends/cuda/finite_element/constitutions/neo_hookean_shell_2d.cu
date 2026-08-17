@@ -6,6 +6,7 @@
 #include <muda/ext/eigen/inverse.h>
 #include <utils/codim_thickness.h>
 #include <utils/make_spd.h>
+#include <utils/fixed_bank_soa_evd.h>
 #include <utils/matrix_assembler.h>
 
 namespace uipc::backend::cuda
@@ -160,7 +161,7 @@ class NeoHookeanShell2D final : public Codim2DConstitution
         using namespace muda;
         namespace NH = sym::neo_hookean_shell_2d;
 
-        ParallelFor()
+        ParallelFor(32)
             .file_line(__FILE__, __LINE__)
             .apply(info.indices().size(),
                    [lambdas = lambdas.cviewer().name("lambdas"),
@@ -176,6 +177,9 @@ class NeoHookeanShell2D final : public Codim2DConstitution
                     half_hessian_size = HalfHessianSize,
                     gradient_only = info.gradient_only()] __device__(int I) mutable
                    {
+                       constexpr int SharedLanePitch = 32;
+                       __shared__ Float shared_h[9 * 9 * SharedLanePitch];
+
                        Vector9  X;
                        Vector3i idx = indices(I);
                        for(int i = 0; i < 3; ++i)
@@ -202,13 +206,16 @@ class NeoHookeanShell2D final : public Codim2DConstitution
                        if(gradient_only)
                            return;
 
-                       Matrix9x9 H;
+                       FixedBankSoAMap<9, SharedLanePitch> H(
+                           shared_h + threadIdx.x);
                        NH::ddEddX(H, lambda, mu, X, IB);
-                       make_spd(H);
-                       H *= Vdt2;
+                       Vector9 eigen_values;
+                       selfadjoint_evd_fixed_bank_shared<9>(H, eigen_values);
 
                        TripletMatrixAssembler TMA{H3x3s};
-                       TMA.half_block<StencilSize>(I * half_hessian_size).write(idx, H);
+                       TMA.half_block<StencilSize>(I * half_hessian_size)
+                           .write_psd_from_eigendecomposition(
+                               idx, H, eigen_values, Vdt2);
                    });
     }
 };

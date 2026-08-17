@@ -145,8 +145,9 @@ namespace sym::codim_ipc_contact
         return E;
     }
 
-    inline __device__ void PT_friction_gradient_hessian(Vector12&    G,
-                                                        Matrix12x12& H,
+    template <typename Hessian>
+    inline __device__ void PT_friction_gradient_hessian(Vector12& G,
+                                                        Hessian&  H,
                                                         Float        kappa,
                                                         Float        d_hat,
                                                         Float        thickness,
@@ -334,8 +335,9 @@ namespace sym::codim_ipc_contact
         return E;
     }
 
-    inline __device__ void EE_friction_gradient_hessian(Vector12&    G,
-                                                        Matrix12x12& H,
+    template <typename Hessian>
+    inline __device__ void EE_friction_gradient_hessian(Vector12& G,
+                                                        Hessian&  H,
                                                         Float        kappa,
                                                         Float        d_hat,
                                                         Float        thickness,
@@ -517,8 +519,9 @@ namespace sym::codim_ipc_contact
         return E;
     }
 
-    inline __device__ void PE_friction_gradient_hessian(Vector9&   G,
-                                                        Matrix9x9& H,
+    template <typename Hessian>
+    inline __device__ void PE_friction_gradient_hessian(Vector9& G,
+                                                        Hessian& H,
                                                         Float      kappa,
                                                         Float      d_hat,
                                                         Float      thickness,
@@ -682,8 +685,9 @@ namespace sym::codim_ipc_contact
         return E;
     }
 
-    inline __device__ void PP_friction_gradient_hessian(Vector6&   G,
-                                                        Matrix6x6& H,
+    template <typename Hessian>
+    inline __device__ void PP_friction_gradient_hessian(Vector6& G,
+                                                        Hessian& H,
                                                         Float      kappa,
                                                         Float      d_hat,
                                                         Float      thickness,

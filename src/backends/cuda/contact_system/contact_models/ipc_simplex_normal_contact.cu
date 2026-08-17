@@ -5,6 +5,7 @@
 #include <kernel_cout.h>
 #include <utils/matrix_assembler.h>
 #include <utils/make_spd.h>
+#include <utils/fixed_bank_soa_evd.h>
 #include <utils/primitive_d_hat.h>
 #include <pipeline/ipc_pipeline_flag.h>
 
@@ -288,11 +289,8 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
         IndexT pe_offset = ee_offset + ee_count;
         IndexT pp_offset = pe_offset + pe_count;
 
-        ParallelFor()
-            .file_line(__FILE__, __LINE__)
-            .apply(
-                total,
-                [gradient_only = info.gradient_only(),
+        auto assemble_kernel =
+            [gradient_only = info.gradient_only(),
                  table = info.contact_tabular().viewer().name("contact_tabular"),
                  contact_ids = info.contact_element_ids().viewer().name("contact_element_ids"),
                  Ps          = info.positions().viewer().name("Ps"),
@@ -319,8 +317,11 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                  // offsets
                  ee_offset,
                  pe_offset,
-                 pp_offset] __device__(IndexT idx) mutable
+                pp_offset] __device__(IndexT idx) mutable
                 {
+                    constexpr int SharedLanePitch = 8;
+                    __shared__ Float shared_h[12 * 12 * SharedLanePitch];
+
                     if(idx < ee_offset)  // PT
                     {
                         int      i    = idx;
@@ -354,14 +355,17 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                         }
                         else
                         {
-                            Matrix12x12 H;
+                            FixedBankSoAMap<12, SharedLanePitch> H(
+                                shared_h + threadIdx.x);
+                            Vector12 eigen_values;
                             PT_barrier_gradient_hessian(
                                 G, H, flag, kt2, d_hat, thickness, P, T0, T1, T2);
-                            make_spd(H);
+                            selfadjoint_evd_fixed_bank_shared<12>(H, eigen_values);
                             DoubletVectorAssembler DVA{PT_Gs};
                             DVA.segment<4>(i * 4).write(PT, G);
                             TripletMatrixAssembler TMA{PT_Hs};
-                            TMA.half_block<4>(i * PTHalfHessianSize).write(PT, H);
+                            TMA.half_block<4>(i * PTHalfHessianSize)
+                                .write_psd_from_eigendecomposition(PT, H, eigen_values);
                         }
                     }
                     else if(idx < pe_offset)  // EE
@@ -401,14 +405,17 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                         }
                         else
                         {
-                            Matrix12x12 H;
+                            FixedBankSoAMap<12, SharedLanePitch> H(
+                                shared_h + threadIdx.x);
+                            Vector12 eigen_values;
                             mollified_EE_barrier_gradient_hessian(
                                 G, H, flag, kt2, d_hat, thickness, t0_Ea0, t0_Ea1, t0_Eb0, t0_Eb1, E0, E1, E2, E3);
-                            make_spd(H);
+                            selfadjoint_evd_fixed_bank_shared<12>(H, eigen_values);
                             DoubletVectorAssembler DVA{EE_Gs};
                             DVA.segment<4>(i * 4).write(EE, G);
                             TripletMatrixAssembler TMA{EE_Hs};
-                            TMA.half_block<4>(i * EEHalfHessianSize).write(EE, H);
+                            TMA.half_block<4>(i * EEHalfHessianSize)
+                                .write_psd_from_eigendecomposition(EE, H, eigen_values);
                         }
                     }
                     else if(idx < pp_offset)  // PE
@@ -440,14 +447,17 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                         }
                         else
                         {
-                            Matrix9x9 H;
+                            FixedBankSoAMap<9, SharedLanePitch> H(
+                                shared_h + threadIdx.x);
+                            Vector9 eigen_values;
                             PE_barrier_gradient_hessian(
                                 G, H, flag, kt2, d_hat, thickness, P, E0, E1);
-                            make_spd(H);
+                            selfadjoint_evd_fixed_bank_shared<9>(H, eigen_values);
                             DoubletVectorAssembler DVA{PE_Gs};
                             DVA.segment<3>(i * 3).write(PE, G);
                             TripletMatrixAssembler TMA{PE_Hs};
-                            TMA.half_block<3>(i * PEHalfHessianSize).write(PE, H);
+                            TMA.half_block<3>(i * PEHalfHessianSize)
+                                .write_psd_from_eigendecomposition(PE, H, eigen_values);
                         }
                     }
                     else  // PP
@@ -474,17 +484,35 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                         }
                         else
                         {
-                            Matrix6x6 H;
+                            FixedBankSoAMap<6, SharedLanePitch> H(
+                                shared_h + threadIdx.x);
+                            Vector6 eigen_values;
                             PP_barrier_gradient_hessian(
                                 G, H, flag, kt2, d_hat, thickness, P0, P1);
-                            make_spd(H);
+                            selfadjoint_evd_fixed_bank_shared<6>(H, eigen_values);
                             DoubletVectorAssembler DVA{PP_Gs};
                             DVA.segment<2>(i * 2).write(PP, G);
                             TripletMatrixAssembler TMA{PP_Hs};
-                            TMA.half_block<2>(i * PPHalfHessianSize).write(PP, H);
+                            TMA.half_block<2>(i * PPHalfHessianSize)
+                                .write_psd_from_eigendecomposition(PP, H, eigen_values);
                         }
                     }
-                });
+                };
+
+        using AssembleCallable = std::decay_t<decltype(assemble_kernel)>;
+        static const cudaError_t preferred_carveout_status =
+            cudaFuncSetAttribute(
+                reinterpret_cast<const void*>(
+                    muda::details::parallel_for_kernel<
+                        AssembleCallable,
+                        muda::Default>),
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                16);
+        checkCudaErrors(preferred_carveout_status);
+
+        ParallelFor(8)
+            .file_line(__FILE__, __LINE__)
+            .apply(total, std::move(assemble_kernel));
     }
 };
 

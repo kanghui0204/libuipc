@@ -9,6 +9,7 @@
 #include <utils/matrix_assembler.h>
 #include <utils/matrix_unpacker.h>
 #include <utils/make_spd.h>
+#include <utils/fixed_bank_soa_evd.h>
 #include <time_integrator/time_integrator.h>
 #include <kernel_cout.h>
 
@@ -451,6 +452,7 @@ class ExternalArticulationConstraint final : public InterAffineBodyConstraint
             auto j_offset = h_art_id_to_joint_offsets_counts.offsets()[art_id];
             ij += Vector2i{j_offset, j_offset};
         }
+
         h_art_id_to_joint_joint_offsets_counts.scan();
 
         // 3. Upload to Device
@@ -844,7 +846,7 @@ class ExternalArticulationConstraint final : public InterAffineBodyConstraint
             return;
 
         // Compute Hessian
-        ParallelFor()
+        ParallelFor(16)
             .file_line(__FILE__, __LINE__)
             .apply(
                 joint_joint_id_to_mass.size(),
@@ -877,6 +879,9 @@ class ExternalArticulationConstraint final : public InterAffineBodyConstraint
                  PrismaticUID =
                      ExternalArticulationConstituion::PrismaticJointConstitutionUID] __device__(IndexT joint_joint_I) mutable
                 {
+                    constexpr int SharedLanePitch = 16;
+                    __shared__ Float shared_h[12 * 12 * SharedLanePitch];
+
                     Float    m_ij = joint_joint_id_to_mass(joint_joint_I);
                     Vector2i ij   = joint_joint_id_to_joint_ij(joint_joint_I);
 
@@ -922,7 +927,6 @@ class ExternalArticulationConstraint final : public InterAffineBodyConstraint
                     Vector<Float, 24> dDeltaTheta_dQ_i = compute_dDeltaTheta_dQ(ij[0]);
                     Vector<Float, 24> dDeltaTheta_dQ_j = compute_dDeltaTheta_dQ(ij[1]);
 
-
                     Matrix<Float, 24, 24> H24x24 =
                         dDeltaTheta_dQ_i * m_ij * dDeltaTheta_dQ_j.transpose();
 
@@ -957,20 +961,26 @@ class ExternalArticulationConstraint final : public InterAffineBodyConstraint
                         {
                             ERJ::F<Float>(F, basis_k, qk, basis_l, ql);
                             ERJ::F<Float>(F_t, basis_k, q_prevk, basis_l, q_prevl);
-                            Matrix12x12 ddDeltaTheta_ddF;
-                            ERJ::ddDeltaTheta_ddF(ddDeltaTheta_ddF, F, F_t);
-                            Matrix12x12 HF = G_theta_i * ddDeltaTheta_ddF;
-                            make_spd(HF);
+                            FixedBankSoAMap<12, SharedLanePitch> HF_workspace(
+                                shared_h + threadIdx.x);
+                            ERJ::ddDeltaTheta_ddF(HF_workspace, F, F_t);
+                            HF_workspace *= G_theta_i;
+                            Matrix12x12 HF;
+                            make_spd_fixed_bank_shared_upper_fma<12>(
+                                HF_workspace, HF);
                             ERJ::JT_H_J(JT_H_J, HF, basis_k, basis_l, basis_k, basis_l);
                         }
                         else if(joint_uid == PrismaticUID)
                         {
                             EPJ::F<Float>(F, basis_k, qk, basis_l, ql);
                             EPJ::F<Float>(F_t, basis_k, q_prevk, basis_l, q_prevl);
-                            Matrix12x12 ddDeltaTheta_ddF;
-                            EPJ::ddDeltaTheta_ddF(ddDeltaTheta_ddF, F, F_t);
-                            Matrix12x12 HF = G_theta_i * ddDeltaTheta_ddF;
-                            make_spd(HF);
+                            FixedBankSoAMap<12, SharedLanePitch> HF_workspace(
+                                shared_h + threadIdx.x);
+                            EPJ::ddDeltaTheta_ddF(HF_workspace, F, F_t);
+                            HF_workspace *= G_theta_i;
+                            Matrix12x12 HF;
+                            make_spd_fixed_bank_shared_upper_fma<12>(
+                                HF_workspace, HF);
                             EPJ::JT_H_J(JT_H_J, HF, basis_k, basis_l, basis_k, basis_l);
                         }
                         else
