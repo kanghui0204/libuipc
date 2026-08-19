@@ -80,20 +80,21 @@ MUDA_GENERIC MUDA_INLINE T __mm_max(T a, T b)
 
 MUDA_DEVICE MUDA_INLINE float atomicMinf(float* addr, float value)
 {
-    float old;
-    old = (value >= 0) ?
-              __int_as_float(atomicMin((int*)addr, __float_as_int(value))) :
-              __uint_as_float(atomicMax((unsigned int*)addr, __float_as_uint(value)));
-    return old;
+    // Classify by the IEEE-754 sign bit: -0.0f compares >= 0.0f but must use
+    // the negative-value integer ordering.
+    const int value_bits = __float_as_int(value);
+    return (value_bits >= 0) ?
+               __int_as_float(atomicMin((int*)addr, value_bits)) :
+               __uint_as_float(atomicMax((unsigned int*)addr, __float_as_uint(value)));
 }
 
 MUDA_DEVICE MUDA_INLINE float atomicMaxf(float* addr, float value)
 {
-    float old;
-    old = (value >= 0) ?
-              __int_as_float(atomicMax((int*)addr, __float_as_int(value))) :
-              __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
-    return old;
+    // See atomicMinf: a numeric comparison misclassifies negative zero.
+    const int value_bits = __float_as_int(value);
+    return (value_bits >= 0) ?
+               __int_as_float(atomicMax((int*)addr, value_bits)) :
+               __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
 }
 
 MUDA_GENERIC MUDA_INLINE uint expandBits(uint v)
@@ -180,12 +181,18 @@ MUDA_INLINE void StacklessBVH::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aa
                                                       muda::VarView<AABB> scene_box)
 {
     using namespace culbvh;
+    using namespace muda;
+
+    Launch(1, 1)
+        .file_line(__FILE__, __LINE__)
+        .apply([out = scene_box.viewer().name("out")] __device__() { *out = AABB(); });
+
+    if(aabbs.size() == 0)
+        return;
 
     auto numQuery = aabbs.size();
     auto BlockDim = K_THREADS;
     auto GridDim  = (numQuery + BlockDim - 1) / BlockDim;
-
-    using namespace muda;
 
     Launch(GridDim, BlockDim)
         .file_line(__FILE__, __LINE__)
@@ -197,18 +204,20 @@ MUDA_INLINE void StacklessBVH::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aa
                 int idx     = blockIdx.x * blockDim.x + threadIdx.x;
                 int warpTid = threadIdx.x % 32;
                 int warpId  = (threadIdx.x >> 5);
-                int warpNum;
-                if(idx >= size)
-                    return;
-                if(idx == 0)
-                {
-                    *_bv = AABB();
-                }
 
                 __shared__ PlainAABB aabbData[K_WARPS];
 
-                PlainAABB temp = toPlainAABB(box(idx));
-                __syncthreads();
+                PlainAABB temp;
+                if(idx < size)
+                {
+                    temp = toPlainAABB(box(idx));
+                }
+                else
+                {
+                    constexpr float maxFloat = 3.402823466e+38F;
+                    temp._min = make_float3(maxFloat, maxFloat, maxFloat);
+                    temp._max = make_float3(-maxFloat, -maxFloat, -maxFloat);
+                }
 
                 // Extract values for warp shuffle
                 float tempMinX = temp._min.x;
@@ -218,14 +227,14 @@ MUDA_INLINE void StacklessBVH::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aa
                 float tempMaxY = temp._max.y;
                 float tempMaxZ = temp._max.z;
 
-                for(int i = 1; i < 32; i = (i << 1))
+                for(int offset = 16; offset > 0; offset >>= 1)
                 {
-                    float otherMinX = __shfl_down_sync(0xffffffff, tempMinX, i);
-                    float otherMinY = __shfl_down_sync(0xffffffff, tempMinY, i);
-                    float otherMinZ = __shfl_down_sync(0xffffffff, tempMinZ, i);
-                    float otherMaxX = __shfl_down_sync(0xffffffff, tempMaxX, i);
-                    float otherMaxY = __shfl_down_sync(0xffffffff, tempMaxY, i);
-                    float otherMaxZ = __shfl_down_sync(0xffffffff, tempMaxZ, i);
+                    float otherMinX = __shfl_down_sync(0xffffffff, tempMinX, offset);
+                    float otherMinY = __shfl_down_sync(0xffffffff, tempMinY, offset);
+                    float otherMinZ = __shfl_down_sync(0xffffffff, tempMinZ, offset);
+                    float otherMaxX = __shfl_down_sync(0xffffffff, tempMaxX, offset);
+                    float otherMaxY = __shfl_down_sync(0xffffffff, tempMaxY, offset);
+                    float otherMaxZ = __shfl_down_sync(0xffffffff, tempMaxZ, offset);
                     tempMinX        = __mm_min(tempMinX, otherMinX);
                     tempMinY        = __mm_min(tempMinY, otherMinY);
                     tempMinZ        = __mm_min(tempMinZ, otherMinZ);
@@ -234,28 +243,24 @@ MUDA_INLINE void StacklessBVH::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aa
                     tempMaxZ        = __mm_max(tempMaxZ, otherMaxZ);
                 }
 
-                if(blockIdx.x == gridDim.x - 1)
-                {
-                    warpNum = ((size - blockIdx.x * blockDim.x + 31) >> 5);
-                }
-                else
-                {
-                    warpNum = ((blockDim.x) >> 5);
-                }
-
                 if(warpTid == 0)
                 {
-                    // Reconstruct AABB from reduced values
                     aabbData[warpId]._min = make_float3(tempMinX, tempMinY, tempMinZ);
                     aabbData[warpId]._max = make_float3(tempMaxX, tempMaxY, tempMaxZ);
                 }
                 __syncthreads();
-                if(threadIdx.x >= warpNum)
-                    return;
 
-                if(warpNum > 1)
+                if(warpId == 0)
                 {
-                    temp     = aabbData[threadIdx.x];
+                    constexpr float maxFloat = 3.402823466e+38F;
+                    if(warpTid < K_WARPS)
+                        temp = aabbData[warpTid];
+                    else
+                    {
+                        temp._min = make_float3(maxFloat, maxFloat, maxFloat);
+                        temp._max = make_float3(-maxFloat, -maxFloat, -maxFloat);
+                    }
+
                     tempMinX = temp._min.x;
                     tempMinY = temp._min.y;
                     tempMinZ = temp._min.z;
@@ -263,14 +268,14 @@ MUDA_INLINE void StacklessBVH::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aa
                     tempMaxY = temp._max.y;
                     tempMaxZ = temp._max.z;
 
-                    for(int i = 1; i < warpNum; i = (i << 1))
+                    for(int offset = 16; offset > 0; offset >>= 1)
                     {
-                        float otherMinX = __shfl_down_sync(0xffffffff, tempMinX, i);
-                        float otherMinY = __shfl_down_sync(0xffffffff, tempMinY, i);
-                        float otherMinZ = __shfl_down_sync(0xffffffff, tempMinZ, i);
-                        float otherMaxX = __shfl_down_sync(0xffffffff, tempMaxX, i);
-                        float otherMaxY = __shfl_down_sync(0xffffffff, tempMaxY, i);
-                        float otherMaxZ = __shfl_down_sync(0xffffffff, tempMaxZ, i);
+                        float otherMinX = __shfl_down_sync(0xffffffff, tempMinX, offset);
+                        float otherMinY = __shfl_down_sync(0xffffffff, tempMinY, offset);
+                        float otherMinZ = __shfl_down_sync(0xffffffff, tempMinZ, offset);
+                        float otherMaxX = __shfl_down_sync(0xffffffff, tempMaxX, offset);
+                        float otherMaxY = __shfl_down_sync(0xffffffff, tempMaxY, offset);
+                        float otherMaxZ = __shfl_down_sync(0xffffffff, tempMaxZ, offset);
                         tempMinX = __mm_min(tempMinX, otherMinX);
                         tempMinY = __mm_min(tempMinY, otherMinY);
                         tempMinZ = __mm_min(tempMinZ, otherMinZ);
@@ -278,16 +283,15 @@ MUDA_INLINE void StacklessBVH::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aa
                         tempMaxY = __mm_max(tempMaxY, otherMaxY);
                         tempMaxZ = __mm_max(tempMaxZ, otherMaxZ);
                     }
-                }
-
-                if(threadIdx.x == 0)
-                {
-                    atomicMinf(&_bv->min().x(), tempMinX);
-                    atomicMinf(&_bv->min().y(), tempMinY);
-                    atomicMinf(&_bv->min().z(), tempMinZ);
-                    atomicMaxf(&_bv->max().x(), tempMaxX);
-                    atomicMaxf(&_bv->max().y(), tempMaxY);
-                    atomicMaxf(&_bv->max().z(), tempMaxZ);
+                    if(warpTid == 0)
+                    {
+                        atomicMinf(&_bv->min().x(), tempMinX);
+                        atomicMinf(&_bv->min().y(), tempMinY);
+                        atomicMinf(&_bv->min().z(), tempMinZ);
+                        atomicMaxf(&_bv->max().x(), tempMaxX);
+                        atomicMaxf(&_bv->max().y(), tempMaxY);
+                        atomicMaxf(&_bv->max().z(), tempMaxZ);
+                    }
                 }
             });
 }
@@ -320,9 +324,10 @@ MUDA_INLINE void StacklessBVH::Impl::calcMCsFromBox(muda::CBufferView<AABB> aabb
 
                    // Get dimensions
                    auto sceneSize = scene->sizes();
-                   codes(idx)     = morton3D(offset.x / sceneSize.x(),
-                                         offset.y / sceneSize.y(),
-                                         offset.z / sceneSize.z());
+                   float nx = sceneSize.x() > 0.0f ? offset.x / sceneSize.x() : 0.0f;
+                   float ny = sceneSize.y() > 0.0f ? offset.y / sceneSize.y() : 0.0f;
+                   float nz = sceneSize.z() > 0.0f ? offset.z / sceneSize.z() : 0.0f;
+                   codes(idx) = morton3D(nx, ny, nz);
                });
 }
 
