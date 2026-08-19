@@ -42,15 +42,20 @@ MUDA_GENERIC MUDA_INLINE T mm_max(T a, T b)
 
 MUDA_DEVICE MUDA_INLINE float atomic_minf(float* addr, float value)
 {
-    return (value >= 0) ?
-               __int_as_float(atomicMin((int*)addr, __float_as_int(value))) :
+    // Classify by the IEEE-754 sign bit: -0.0f compares >= 0.0f but must use
+    // the negative-value integer ordering.
+    const int value_bits = __float_as_int(value);
+    return (value_bits >= 0) ?
+               __int_as_float(atomicMin((int*)addr, value_bits)) :
                __uint_as_float(atomicMax((unsigned int*)addr, __float_as_uint(value)));
 }
 
 MUDA_DEVICE MUDA_INLINE float atomic_maxf(float* addr, float value)
 {
-    return (value >= 0) ?
-               __int_as_float(atomicMax((int*)addr, __float_as_int(value))) :
+    // See atomic_minf: a numeric comparison misclassifies negative zero.
+    const int value_bits = __float_as_int(value);
+    return (value_bits >= 0) ?
+               __int_as_float(atomicMax((int*)addr, value_bits)) :
                __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
 }
 
@@ -117,10 +122,15 @@ using namespace info_stackless_v0_detail;
 inline void InfoStacklessBVHV0::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aabbs,
                                                        muda::VarView<AABB> scene_box)
 {
+    using namespace muda;
+
+    Launch(1, 1)
+        .file_line(__FILE__, __LINE__)
+        .apply([out = scene_box.viewer().name("out")] __device__() { *out = AABB(); });
+
     if(aabbs.size() == 0)
         return;
 
-    using namespace muda;
     auto num  = aabbs.size();
     auto grid = (num + K_THREADS - 1) / K_THREADS;
 
@@ -132,26 +142,32 @@ inline void InfoStacklessBVHV0::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> a
              out  = scene_box.viewer().name("out")] __device__()
             {
                 int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                if(idx >= size)
-                    return;
-                if(idx == 0)
-                    *out = AABB();
-
                 __shared__ PlainAABB warp_boxes[K_WARPS];
-                auto                 temp     = to_plain(box(idx));
                 int                  warp_tid = threadIdx.x & 31;
                 int                  warp_id  = threadIdx.x >> 5;
 
+                PlainAABB temp;
+                if(idx < size)
+                {
+                    temp = to_plain(box(idx));
+                }
+                else
+                {
+                    constexpr float max_float = 3.402823466e+38F;
+                    temp._min = make_float3(max_float, max_float, max_float);
+                    temp._max = make_float3(-max_float, -max_float, -max_float);
+                }
+
                 float minx = temp._min.x, miny = temp._min.y, minz = temp._min.z;
                 float maxx = temp._max.x, maxy = temp._max.y, maxz = temp._max.z;
-                for(int i = 1; i < 32; i <<= 1)
+                for(int offset = 16; offset > 0; offset >>= 1)
                 {
-                    minx = mm_min(minx, __shfl_down_sync(0xffffffff, minx, i));
-                    miny = mm_min(miny, __shfl_down_sync(0xffffffff, miny, i));
-                    minz = mm_min(minz, __shfl_down_sync(0xffffffff, minz, i));
-                    maxx = mm_max(maxx, __shfl_down_sync(0xffffffff, maxx, i));
-                    maxy = mm_max(maxy, __shfl_down_sync(0xffffffff, maxy, i));
-                    maxz = mm_max(maxz, __shfl_down_sync(0xffffffff, maxz, i));
+                    minx = mm_min(minx, __shfl_down_sync(0xffffffff, minx, offset));
+                    miny = mm_min(miny, __shfl_down_sync(0xffffffff, miny, offset));
+                    minz = mm_min(minz, __shfl_down_sync(0xffffffff, minz, offset));
+                    maxx = mm_max(maxx, __shfl_down_sync(0xffffffff, maxx, offset));
+                    maxy = mm_max(maxy, __shfl_down_sync(0xffffffff, maxy, offset));
+                    maxz = mm_max(maxz, __shfl_down_sync(0xffffffff, maxz, offset));
                 }
                 if(warp_tid == 0)
                 {
@@ -160,36 +176,41 @@ inline void InfoStacklessBVHV0::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> a
                 }
                 __syncthreads();
 
-                int warp_num = (blockIdx.x == gridDim.x - 1) ?
-                                   ((size - blockIdx.x * blockDim.x + 31) >> 5) :
-                                   (blockDim.x >> 5);
-                if(threadIdx.x >= warp_num)
-                    return;
+                if(warp_id == 0)
+                {
+                    constexpr float max_float = 3.402823466e+38F;
+                    if(warp_tid < K_WARPS)
+                        temp = warp_boxes[warp_tid];
+                    else
+                    {
+                        temp._min = make_float3(max_float, max_float, max_float);
+                        temp._max = make_float3(-max_float, -max_float, -max_float);
+                    }
 
-                temp = warp_boxes[threadIdx.x];
-                minx = temp._min.x;
-                miny = temp._min.y;
-                minz = temp._min.z;
-                maxx = temp._max.x;
-                maxy = temp._max.y;
-                maxz = temp._max.z;
-                for(int i = 1; i < warp_num; i <<= 1)
-                {
-                    minx = mm_min(minx, __shfl_down_sync(0xffffffff, minx, i));
-                    miny = mm_min(miny, __shfl_down_sync(0xffffffff, miny, i));
-                    minz = mm_min(minz, __shfl_down_sync(0xffffffff, minz, i));
-                    maxx = mm_max(maxx, __shfl_down_sync(0xffffffff, maxx, i));
-                    maxy = mm_max(maxy, __shfl_down_sync(0xffffffff, maxy, i));
-                    maxz = mm_max(maxz, __shfl_down_sync(0xffffffff, maxz, i));
-                }
-                if(threadIdx.x == 0)
-                {
-                    atomic_minf(&out->min().x(), minx);
-                    atomic_minf(&out->min().y(), miny);
-                    atomic_minf(&out->min().z(), minz);
-                    atomic_maxf(&out->max().x(), maxx);
-                    atomic_maxf(&out->max().y(), maxy);
-                    atomic_maxf(&out->max().z(), maxz);
+                    minx = temp._min.x;
+                    miny = temp._min.y;
+                    minz = temp._min.z;
+                    maxx = temp._max.x;
+                    maxy = temp._max.y;
+                    maxz = temp._max.z;
+                    for(int offset = 16; offset > 0; offset >>= 1)
+                    {
+                        minx = mm_min(minx, __shfl_down_sync(0xffffffff, minx, offset));
+                        miny = mm_min(miny, __shfl_down_sync(0xffffffff, miny, offset));
+                        minz = mm_min(minz, __shfl_down_sync(0xffffffff, minz, offset));
+                        maxx = mm_max(maxx, __shfl_down_sync(0xffffffff, maxx, offset));
+                        maxy = mm_max(maxy, __shfl_down_sync(0xffffffff, maxy, offset));
+                        maxz = mm_max(maxz, __shfl_down_sync(0xffffffff, maxz, offset));
+                    }
+                    if(warp_tid == 0)
+                    {
+                        atomic_minf(&out->min().x(), minx);
+                        atomic_minf(&out->min().y(), miny);
+                        atomic_minf(&out->min().z(), minz);
+                        atomic_maxf(&out->max().x(), maxx);
+                        atomic_maxf(&out->max().y(), maxy);
+                        atomic_maxf(&out->max().z(), maxz);
+                    }
                 }
             });
 }
@@ -214,9 +235,10 @@ inline void InfoStacklessBVHV0::Impl::calcMCsFromBox(muda::CBufferView<AABB> aab
                        make_float3(scene_min.x(), scene_min.y(), scene_min.z());
                    auto   scene_size = scene->sizes();
                    float3 off        = c - smin;
-                   codes(idx)        = morton3D(off.x / scene_size.x(),
-                                                off.y / scene_size.y(),
-                                                off.z / scene_size.z());
+                   float nx = scene_size.x() > 0.0f ? off.x / scene_size.x() : 0.0f;
+                   float ny = scene_size.y() > 0.0f ? off.y / scene_size.y() : 0.0f;
+                   float nz = scene_size.z() > 0.0f ? off.z / scene_size.z() : 0.0f;
+                   codes(idx) = morton3D(nx, ny, nz);
                });
 }
 
