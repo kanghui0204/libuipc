@@ -3,6 +3,8 @@
 #include <utils/codim_thickness.h>
 #include <kernel_cout.h>
 #include <utils/make_spd.h>
+#include <utils/fixed_bank_soa_evd.h>
+#include <utils/contact_type_block_layout.h>
 #include <utils/matrix_assembler.h>
 #include <utils/primitive_d_hat.h>
 #include <pipeline/ipc_pipeline_flag.h>
@@ -286,13 +288,22 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
         if(total == 0)
             return;
 
-        IndexT ee_offset = pt_count;
-        IndexT pe_offset = ee_offset + ee_count;
-        IndexT pp_offset = pe_offset + pe_count;
+        // Keep each contact type in its own CTA. The padding lanes return
+        // immediately instead of sharing a warp with the next contact formula.
+        constexpr int BlockSize = 12;
+        const auto layout = make_contact_type_block_layout<BlockSize>(
+            pt_count, ee_count, pe_count, pp_count);
+        const IndexT pt_end       = layout.pt_end;
+        const IndexT ee_offset    = layout.ee_offset;
+        const IndexT ee_end       = layout.ee_end;
+        const IndexT pe_offset    = layout.pe_offset;
+        const IndexT pe_end       = layout.pe_end;
+        const IndexT pp_offset    = layout.pp_offset;
+        const IndexT padded_total = layout.padded_total;
 
-        ParallelFor()
+        ParallelFor(BlockSize)
             .file_line(__FILE__, __LINE__)
-            .apply(total,
+            .apply(padded_total,
                    [gradient_only = info.gradient_only(),
                     table       = info.contact_tabular().viewer().name("contact_tabular"),
                     contact_ids = info.contact_element_ids().viewer().name("contact_element_ids"),
@@ -320,9 +331,17 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
                     PP_Gs  = info.friction_PP_gradients().viewer().name("PP_Gs"),
                     PP_Hs  = info.friction_PP_hessians().viewer().name("PP_Hs"),
                     // offsets
-                    ee_offset, pe_offset, pp_offset] __device__(IndexT idx) mutable
+                   pt_end,
+                   ee_offset,
+                   ee_end,
+                   pe_offset,
+                   pe_end,
+                   pp_offset] __device__(IndexT idx) mutable
                    {
-                       if(idx < ee_offset)
+                       constexpr int SharedLanePitch = 16;
+                       __shared__ Float shared_h[12 * 12 * SharedLanePitch];
+
+                       if(idx < pt_end)
                        {
                            // PT friction
                            int i = idx;
@@ -358,18 +377,25 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
                            }
                            else
                            {
-                               Matrix12x12 H;
+                               FixedBankSoAMap<12, SharedLanePitch> H(
+                                   shared_h + threadIdx.x);
+                               Vector12 eigen_values;
                                PT_friction_gradient_hessian(G, H, kt2, d_hat, thickness, mu, eps_v * dt,
                                                             prev_P, prev_T0, prev_T1, prev_T2,
                                                             P, T0, T1, T2);
-                               cuda::make_spd(H);
+                               cuda::selfadjoint_evd_fixed_bank_shared<12>(H, eigen_values);
                                DoubletVectorAssembler DVA{PT_Gs};
                                DVA.segment<4>(i * 4).write(PT, G);
                                TripletMatrixAssembler TMA{PT_Hs};
-                               TMA.half_block<4>(i * PTHalfHessianSize).write(PT, H);
+                               TMA.half_block<4>(i * PTHalfHessianSize)
+                                   .write_psd_from_eigendecomposition(PT, H, eigen_values);
                            }
                        }
-                       else if(idx < pe_offset)
+                       else if(idx < ee_offset)
+                       {
+                           return;  // PT padding
+                       }
+                       else if(idx < ee_end)
                        {
                            // EE friction
                            int i = idx - ee_offset;
@@ -417,7 +443,9 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
                            }
                            else
                            {
-                               Matrix12x12 H;
+                           FixedBankSoAMap<12, SharedLanePitch> H(
+                               shared_h + threadIdx.x);
+                           Vector12 eigen_values;
                                if(mollified)
                                {
                                    G.setZero();
@@ -428,15 +456,23 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
                                    EE_friction_gradient_hessian(G, H, kt2, d_hat, thickness, mu, eps_v * dt,
                                                                 prev_Ea0, prev_Ea1, prev_Eb0, prev_Eb1,
                                                                 Ea0, Ea1, Eb0, Eb1);
-                                   cuda::make_spd(H);
+                                   cuda::selfadjoint_evd_fixed_bank_shared<12>(H, eigen_values);
                                }
                                DoubletVectorAssembler DVA{EE_Gs};
                                DVA.segment<4>(i * 4).write(EE, G);
                                TripletMatrixAssembler TMA{EE_Hs};
-                               TMA.half_block<4>(i * EEHalfHessianSize).write(EE, H);
+                               if(mollified)
+                                   TMA.half_block<4>(i * EEHalfHessianSize).write(EE, H);
+                               else
+                                   TMA.half_block<4>(i * EEHalfHessianSize)
+                                       .write_psd_from_eigendecomposition(EE, H, eigen_values);
                            }
                        }
-                       else if(idx < pp_offset)
+                       else if(idx < pe_offset)
+                       {
+                           return;  // EE padding
+                       }
+                       else if(idx < pe_end)
                        {
                            // PE friction
                            int i = idx - pe_offset;
@@ -466,15 +502,22 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
                            }
                            else
                            {
-                               Matrix9x9 H;
+                               FixedBankSoAMap<9, SharedLanePitch> H(
+                                   shared_h + threadIdx.x);
+                               Vector9 eigen_values;
                                PE_friction_gradient_hessian(G, H, kt2, d_hat, thickness, mu, eps_v * dt,
                                                             prev_P, prev_E0, prev_E1, P, E0, E1);
-                               cuda::make_spd(H);
+                               cuda::selfadjoint_evd_fixed_bank_shared<9>(H, eigen_values);
                                DoubletVectorAssembler DVA{PE_Gs};
                                DVA.segment<3>(i * 3).write(PE, G);
                                TripletMatrixAssembler TMA{PE_Hs};
-                               TMA.half_block<3>(i * PEHalfHessianSize).write(PE, H);
+                               TMA.half_block<3>(i * PEHalfHessianSize)
+                                   .write_psd_from_eigendecomposition(PE, H, eigen_values);
                            }
+                       }
+                       else if(idx < pp_offset)
+                       {
+                           return;  // PE padding
                        }
                        else
                        {
@@ -504,14 +547,17 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
                            }
                            else
                            {
-                               Matrix6x6 H;
+                               FixedBankSoAMap<6, SharedLanePitch> H(
+                                   shared_h + threadIdx.x);
+                               Vector6 eigen_values;
                                PP_friction_gradient_hessian(G, H, kt2, d_hat, thickness, mu, eps_v * dt,
                                                             prev_P0, prev_P1, P0, P1);
-                               cuda::make_spd(H);
+                               cuda::selfadjoint_evd_fixed_bank_shared<6>(H, eigen_values);
                                DoubletVectorAssembler DVA{PP_Gs};
                                DVA.segment<2>(i * 2).write(PP, G);
                                TripletMatrixAssembler TMA{PP_Hs};
-                               TMA.half_block<2>(i * PPHalfHessianSize).write(PP, H);
+                               TMA.half_block<2>(i * PPHalfHessianSize)
+                                   .write_psd_from_eigendecomposition(PP, H, eigen_values);
                            }
                        }
                    });
