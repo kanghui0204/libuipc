@@ -195,6 +195,9 @@ class InfoStacklessBVH
         muda::DeviceVector<int>      int_par;
         muda::DeviceVector<int>      int_range_x;
         muda::DeviceVector<int>      int_range_y;
+        // Maximum Morton-sorted leaf rank for each reordered internal node.
+        // Used only by stacklessSelf to skip the already-covered half-tree.
+        muda::DeviceVector<int>      self_max_rank;
         muda::DeviceVector<uint32_t> int_mark;
         muda::DeviceVector<AABB>     int_aabb;
         muda::DeviceVector<IndexT>   ext_bid;

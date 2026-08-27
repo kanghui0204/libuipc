@@ -259,7 +259,10 @@ void run_internal_cull_proof_case()
                  h_leaf_pair_calls,
                  h_pairs);
 
-    CHECK(h_node_cull_calls == n);
+    // Rank-first self pruning skips the root for the final Morton-rank query:
+    // the root cannot contain a leaf with rank greater than n - 1. The other
+    // n - 1 queries still reach the root and are rejected by node_cull.
+    CHECK(h_node_cull_calls == n - 1);
     CHECK(h_leaf_pair_calls == 0);
     CHECK(h_pairs == 0);
 }
