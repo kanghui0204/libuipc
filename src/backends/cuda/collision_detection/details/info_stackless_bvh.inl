@@ -481,6 +481,7 @@ inline void InfoStacklessBVH::Impl::reorderNode(int int_size)
                 _int_lc      = int_lc.viewer().name("int_lc"),
                 _int_mark    = int_mark.viewer().name("int_mark"),
                 _int_range_y = int_range_y.viewer().name("int_range_y"),
+                _self_max_rank = self_max_rank.viewer().name("self_max_rank"),
                 _int_box     = int_aabb.viewer().name("int_box"),
                 _int_bid     = int_bid.viewer().name("int_bid"),
                 _int_cid     = int_cid.viewer().name("int_cid"),
@@ -508,6 +509,7 @@ inline void InfoStacklessBVH::Impl::reorderNode(int int_size)
                    Node     n;
                    int      new_id = _tk_map(idx);
                    uint32_t m      = _int_mark(idx);
+                   _self_max_rank(new_id) = _int_range_y(idx);
                    n.lc = (m & 1) ? _int_lc(idx) + int_size : _tk_map(_int_lc(idx));
                    n.bound = _int_box(idx);
                    int ie  = _lvs_lca(_int_range_y(idx) + 1);
@@ -535,10 +537,11 @@ inline void InfoStacklessBVH::Impl::build(muda::CBufferView<AABB>   aabbs,
     bids          = _bids;
     cids          = _cids;
     auto num_objs = aabbs.size();
+    auto num_internal = num_objs > 0 ? num_objs - 1 : 0;
+    self_max_rank.resize(num_internal);
     if(num_objs == 0)
         return;
 
-    auto num_internal = num_objs - 1;
     auto num_nodes    = num_objs * 2 - 1;
     mtcode.resize(num_objs);
     sorted_id.resize(num_objs);
@@ -618,6 +621,7 @@ void InfoStacklessBVH::Impl::stacklessSelf(NodeCull                   node_cull,
              numObjs  = num_objs,
              _lvs_idx = ext_idx.viewer().name("lvs_idx"),
              _nodes   = nodes.viewer().name("nodes"),
+             _self_max_rank = self_max_rank.viewer().name("self_max_rank"),
              _bids    = bids.viewer().name("bids"),  // needed for SMem pre-load
              _cids    = cids.viewer().name("cids"),  // needed for SMem pre-load
              has_info,
@@ -672,6 +676,13 @@ void InfoStacklessBVH::Impl::stacklessSelf(NodeCull                   node_cull,
                         {
                             if(st == -1)
                                 break;
+                            // The existing leaf gate only accepts ranks above tid.
+                            // Skip an internal subtree when its maximum rank cannot pass.
+                            if(st < intSize && _self_max_rank(st) <= tid)
+                            {
+                                st = _nodes(st).escape;
+                                continue;
+                            }
                             auto node = _nodes(st);
                             if(!node.bound.intersects(bv))
                             {

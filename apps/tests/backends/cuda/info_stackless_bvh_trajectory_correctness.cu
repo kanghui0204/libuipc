@@ -87,6 +87,19 @@ std::vector<AABB> make_reverse_morton_overlapping_boxes(size_t count)
     return boxes;
 }
 
+std::vector<AABB> make_permuted_morton_overlapping_boxes()
+{
+    // Raw ids 0,1,2,3 have increasing-x (and therefore Morton) order
+    // 1,3,2,0. The centers are distinct, so this does not depend on tie order;
+    // the common extent keeps every pair overlapping.
+    constexpr std::array<float, 4> x_by_raw_id = {3.0f, 0.0f, 2.0f, 1.0f};
+    std::vector<AABB>              boxes;
+    boxes.reserve(x_by_raw_id.size());
+    for(float x : x_by_raw_id)
+        boxes.push_back(make_box(x, 0.0f, 0.0f, 4.0f));
+    return boxes;
+}
+
 PairList brute_force_self(const std::vector<AABB>& boxes)
 {
     PairList pairs;
@@ -718,6 +731,16 @@ TEST_CASE("T00 InfoStacklessBVH exact pairs at launch boundaries",
             auto actual   = run_self_allow_all(boxes, expected.size() + 1);
             check_exact_pair_multiset(std::move(actual), std::move(expected));
         }
+    }
+
+    SECTION("stacklessSelf maps subtree max rank through reordered node ids")
+    {
+        auto boxes    = make_permuted_morton_overlapping_boxes();
+        auto expected = brute_force_self(boxes);
+        REQUIRE(expected.size() == 6);
+
+        auto actual = run_self_allow_all(boxes, expected.size() + 1);
+        check_exact_pair_multiset(std::move(actual), std::move(expected));
     }
 
     const auto tree_boxes = make_sparse_cluster_boxes(65);
