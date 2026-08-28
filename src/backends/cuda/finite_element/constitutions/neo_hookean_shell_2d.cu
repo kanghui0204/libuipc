@@ -120,7 +120,7 @@ class NeoHookeanShell2D final : public Codim2DConstitution
         using namespace muda;
         namespace NH = sym::neo_hookean_shell_2d;
 
-        ParallelFor()
+        ParallelFor(128)
             .file_line(__FILE__, __LINE__)
             .apply(info.indices().size(),
                    [lambdas    = lambdas.cviewer().name("lambdas"),
