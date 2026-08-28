@@ -16,9 +16,20 @@ using Vector2i = uipc::Vector2i;
 using uint     = uint32_t;
 using ullint   = unsigned long long;
 
-constexpr int  K_THREADS         = 256;
-constexpr int  K_WARPS           = K_THREADS >> 5;
-constexpr int  MAX_RES_PER_BLOCK = 1024;
+constexpr int K_BUILD_THREADS = 256;
+constexpr int K_BUILD_WARPS   = K_BUILD_THREADS >> 5;
+
+constexpr int K_SELF_THREADS                = 64;
+constexpr int K_SELF_QUEUE_SLOTS_PER_THREAD = 4;
+constexpr int K_SELF_MAX_RES_PER_BLOCK =
+    K_SELF_THREADS * K_SELF_QUEUE_SLOTS_PER_THREAD;
+
+constexpr int K_OTHER_THREADS           = 256;
+constexpr int K_OTHER_MAX_RES_PER_BLOCK = 1024;
+
+static_assert(K_BUILD_THREADS % 32 == 0);
+static_assert(K_SELF_THREADS % 32 == 0);
+static_assert(K_OTHER_THREADS % 32 == 0);
 constexpr int  AABB_BITS         = 15;
 constexpr uint AABB_MASK         = 0xFFFFFFFFu >> (32 - AABB_BITS);
 
@@ -145,9 +156,9 @@ inline void InfoStacklessBVH::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aab
         return;
 
     auto num  = aabbs.size();
-    auto grid = (num + K_THREADS - 1) / K_THREADS;
+    auto grid = (num + K_BUILD_THREADS - 1) / K_BUILD_THREADS;
 
-    Launch(grid, K_THREADS)
+    Launch(grid, K_BUILD_THREADS)
         .file_line(__FILE__, __LINE__)
         .apply(
             [size = aabbs.size(),
@@ -155,7 +166,7 @@ inline void InfoStacklessBVH::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aab
              out  = scene_box.viewer().name("out")] __device__()
             {
                 int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                __shared__ PlainAABB warp_boxes[K_WARPS];
+                __shared__ PlainAABB warp_boxes[K_BUILD_WARPS];
                 int                  warp_tid = threadIdx.x & 31;
                 int                  warp_id  = threadIdx.x >> 5;
 
@@ -192,7 +203,7 @@ inline void InfoStacklessBVH::Impl::calcMaxBVFromBox(muda::CBufferView<AABB> aab
                 if(warp_id == 0)
                 {
                     constexpr float max_float = 3.402823466e+38F;
-                    if(warp_tid < K_WARPS)
+                    if(warp_tid < K_BUILD_WARPS)
                         temp = warp_boxes[warp_tid];
                     else
                     {
@@ -608,12 +619,12 @@ void InfoStacklessBVH::Impl::stacklessSelf(NodeCull                   node_cull,
     using namespace muda;
     auto num_query = static_cast<int>(ext_aabb.size());
     auto num_objs  = num_query;
-    auto grid      = (num_query + K_THREADS - 1) / K_THREADS;
+    auto grid      = (num_query + K_SELF_THREADS - 1) / K_SELF_THREADS;
 
     constexpr IndexT invalid = static_cast<IndexT>(-1);
     bool has_info = bids.size() == (size_t)num_objs && cids.size() == (size_t)num_objs;
 
-    Launch(grid, K_THREADS)
+    Launch(grid, K_SELF_THREADS)
         .apply(
             [Size     = num_query,
              _box     = objs.viewer().name("box"),
@@ -642,20 +653,21 @@ void InfoStacklessBVH::Impl::stacklessSelf(NodeCull                   node_cull,
 
                 // -----------------------------------------------------------------
                 // SMem: pre-load query bid/cid once per thread, before hot loop.
-                // Shared memory layout (per block, K_THREADS=256):
-                //   s_qbid[256]   = 1 KB
-                //   s_qcid[256]   = 1 KB
-                //   shared_res[1024 * sizeof(int2)] = 8 KB   (existing)
-                //   shared_counter, shared_global_idx         (existing)
-                // Total: ~10 KB — well within the 48 KB limit.
+                // Shared memory layout scales with the Self CTA and queue.
+                // The queue keeps four candidate-pair slots per thread.
+                //   s_qbid[K_SELF_THREADS]
+                //   s_qcid[K_SELF_THREADS]
+                //   shared_res[K_SELF_MAX_RES_PER_BLOCK]
+                //   shared_counter, shared_global_idx
+                // Total shared memory scales with the selected configuration.
                 // -----------------------------------------------------------------
-                __shared__ IndexT s_qbid[K_THREADS];
-                __shared__ IndexT s_qcid[K_THREADS];
+                __shared__ IndexT s_qbid[K_SELF_THREADS];
+                __shared__ IndexT s_qcid[K_SELF_THREADS];
 
                 s_qbid[threadIdx.x] = (active && has_info) ? _bids(idx) : invalid;
                 s_qcid[threadIdx.x] = (active && has_info) ? _cids(idx) : invalid;
 
-                __shared__ int2 shared_res[MAX_RES_PER_BLOCK];
+                __shared__ int2 shared_res[K_SELF_MAX_RES_PER_BLOCK];
                 __shared__ int  shared_counter;
                 __shared__ int  shared_global_idx;
                 if(threadIdx.x == 0)
@@ -712,7 +724,7 @@ void InfoStacklessBVH::Impl::stacklessSelf(NodeCull                   node_cull,
                                     if(pair_pred(leaf_info))
                                     {
                                         int sidx = atomicAdd(&shared_counter, 1);
-                                        if(sidx >= MAX_RES_PER_BLOCK)
+                                        if(sidx >= K_SELF_MAX_RES_PER_BLOCK)
                                             break;
                                         shared_res[sidx] = pair;
                                     }
@@ -725,14 +737,14 @@ void InfoStacklessBVH::Impl::stacklessSelf(NodeCull                   node_cull,
                         MUDA_ASSERT(inner_i < max_iter, "Exceeded max stackless iteration");
                     }
                     __syncthreads();
-                    int total = min(shared_counter, MAX_RES_PER_BLOCK);
+                    int total = min(shared_counter, K_SELF_MAX_RES_PER_BLOCK);
                     if(threadIdx.x == 0)
                         shared_global_idx = atomicAdd(resCounter.data(), total);
                     __syncthreads();
                     int gidx = shared_global_idx;
                     if(threadIdx.x == 0)
                         shared_counter = 0;
-                    bool done = total < MAX_RES_PER_BLOCK;
+                    bool done = total < K_SELF_MAX_RES_PER_BLOCK;
                     safe_copy_to(shared_res,
                                  total,
                                  res.data(),
@@ -763,13 +775,13 @@ void InfoStacklessBVH::Impl::stacklessOther(NodeCull                node_cull,
     using namespace muda;
     auto num_query = static_cast<int>(query_aabbs.size());
     auto num_objs  = static_cast<int>(ext_aabb.size());
-    auto grid      = (num_query + K_THREADS - 1) / K_THREADS;
+    auto grid      = (num_query + K_OTHER_THREADS - 1) / K_OTHER_THREADS;
 
     constexpr IndexT invalid   = static_cast<IndexT>(-1);
     bool             qhas_info = query_bids.size() == (size_t)num_query
                                  && query_cids.size() == (size_t)num_query;
 
-    Launch(grid, K_THREADS)
+    Launch(grid, K_OTHER_THREADS)
         .apply(
             [Size      = num_query,
              _box      = query_aabbs.viewer().name("qbox"),
@@ -799,13 +811,13 @@ void InfoStacklessBVH::Impl::stacklessOther(NodeCull                node_cull,
                 // -----------------------------------------------------------------
                 // SMem: pre-load per-query bid/cid before the traversal loop.
                 // -----------------------------------------------------------------
-                __shared__ IndexT s_qbid[K_THREADS];
-                __shared__ IndexT s_qcid[K_THREADS];
+                __shared__ IndexT s_qbid[K_OTHER_THREADS];
+                __shared__ IndexT s_qcid[K_OTHER_THREADS];
 
                 s_qbid[threadIdx.x] = (active && qhas_info) ? _qbids(idx) : invalid;
                 s_qcid[threadIdx.x] = (active && qhas_info) ? _qcids(idx) : invalid;
 
-                __shared__ int2 shared_res[MAX_RES_PER_BLOCK];
+                __shared__ int2 shared_res[K_OTHER_MAX_RES_PER_BLOCK];
                 __shared__ int  shared_counter;
                 __shared__ int  shared_global_idx;
                 if(threadIdx.x == 0)
@@ -848,7 +860,7 @@ void InfoStacklessBVH::Impl::stacklessOther(NodeCull                node_cull,
                                 if(pair_pred(leaf_info))
                                 {
                                     int sidx = atomicAdd(&shared_counter, 1);
-                                    if(sidx >= MAX_RES_PER_BLOCK)
+                                    if(sidx >= K_OTHER_MAX_RES_PER_BLOCK)
                                         break;
                                     shared_res[sidx] = pair;
                                 }
@@ -861,7 +873,7 @@ void InfoStacklessBVH::Impl::stacklessOther(NodeCull                node_cull,
                     }
 
                     __syncthreads();
-                    int total = min(shared_counter, MAX_RES_PER_BLOCK);
+                    int total = min(shared_counter, K_OTHER_MAX_RES_PER_BLOCK);
                     if(threadIdx.x == 0)
                         shared_global_idx = atomicAdd(resCounter.data(), total);
                     __syncthreads();
@@ -869,7 +881,7 @@ void InfoStacklessBVH::Impl::stacklessOther(NodeCull                node_cull,
                     if(threadIdx.x == 0)
                         shared_counter = 0;
                     __syncthreads();
-                    bool done = total < MAX_RES_PER_BLOCK;
+                    bool done = total < K_OTHER_MAX_RES_PER_BLOCK;
                     safe_copy_to(shared_res,
                                  total,
                                  res.data(),
