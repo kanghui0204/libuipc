@@ -1,6 +1,7 @@
 #include <linear_system/fused_pcg_kernels.h>
 
 #include <cub/block/block_reduce.cuh>
+#include <algorithm>
 #include <cmath>
 #include <uipc/common/log.h>
 
@@ -78,6 +79,70 @@ namespace
             *rz_old_next = *rz_new;
             *rz_new_next = Float{0.0};
         }
+    }
+
+    __global__ void update_convergence_p_prepare_next_kernel(
+        Float* __restrict__                    p,
+        const Float* __restrict__              z,
+        SizeT                                  vector_size,
+        const Float* __restrict__              rz_old,
+        const Float* __restrict__              rz_new,
+        Float* __restrict__                    beta,
+        Float* __restrict__                    rz_old_next,
+        Float* __restrict__                    rz_new_next,
+        IndexT* __restrict__                   status,
+        FusedPcgCheckState* __restrict__ check_state,
+        const FusedPcgDeviceParams* __restrict__ params,
+        IndexT                                  iteration_in_chunk)
+    {
+        __shared__ Float  block_beta;
+        __shared__ IndexT block_updates_p;
+
+        if(threadIdx.x == 0)
+        {
+            const bool active = iteration_is_active(params, iteration_in_chunk);
+            const bool running =
+                active && *status == static_cast<IndexT>(FusedPcgStatus::Running);
+            block_updates_p = 0;
+            if(running)
+            {
+                const Float old_value = *rz_old;
+                const Float new_value = *rz_new;
+                const bool converged  = fabs(new_value) <= params->tolerance;
+                if(!converged)
+                {
+                    block_beta     = new_value / old_value;
+                    block_updates_p = 1;
+                }
+
+                if(blockIdx.x == 0)
+                {
+                    if(converged)
+                        *status = static_cast<IndexT>(FusedPcgStatus::Converged);
+                    else
+                        *beta = block_beta;
+
+                    check_state->rz = new_value;
+                    check_state->status =
+                        converged ? static_cast<IndexT>(FusedPcgStatus::Converged) :
+                                    static_cast<IndexT>(FusedPcgStatus::Running);
+                    check_state->iteration_in_chunk = iteration_in_chunk;
+
+                    // Preserve the legacy zero-length behavior: the old
+                    // prepare-next launch was skipped when p.size() == 0.
+                    if(!converged && vector_size != 0)
+                    {
+                        *rz_old_next = new_value;
+                        *rz_new_next = Float{0.0};
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        const SizeT i = static_cast<SizeT>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if(block_updates_p && i < vector_size)
+            p[i] = z[i] + block_beta * p[i];
     }
 
     __global__ void identity_update_apply_dot_kernel(Float* __restrict__ x,
@@ -308,6 +373,41 @@ void launch_fused_pcg_update_p_prepare_next(muda::DenseVectorView<Float>  p,
         rz_old_next.data(),
         rz_new_next.data(),
         status.data(),
+        params.data(),
+        iteration_in_chunk);
+}
+
+void launch_fused_pcg_update_convergence_p_prepare_next(
+    muda::DenseVectorView<Float>        p,
+    muda::CDenseVectorView<Float>       z,
+    muda::CVarView<Float>               rz_old,
+    muda::CVarView<Float>               rz_new,
+    muda::VarView<Float>                beta,
+    muda::VarView<Float>                rz_old_next,
+    muda::VarView<Float>                rz_new_next,
+    muda::VarView<IndexT>               status,
+    muda::VarView<FusedPcgCheckState> check_state,
+    muda::CVarView<FusedPcgDeviceParams> params,
+    IndexT                               iteration_in_chunk,
+    cudaStream_t                         stream)
+{
+    UIPC_ASSERT(p.size() == z.size(),
+                "fused PCG p/z vectors must have the same size");
+    const int grid_size =
+        std::max(1,
+                 static_cast<int>((p.size() + PcgVectorBlockSize - 1)
+                                  / PcgVectorBlockSize));
+    update_convergence_p_prepare_next_kernel<<<grid_size, PcgVectorBlockSize, 0, stream>>>(
+        p.data(),
+        z.data(),
+        p.size(),
+        rz_old.data(),
+        rz_new.data(),
+        beta.data(),
+        rz_old_next.data(),
+        rz_new_next.data(),
+        status.data(),
+        check_state.data(),
         params.data(),
         iteration_in_chunk);
 }

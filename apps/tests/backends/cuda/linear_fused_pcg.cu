@@ -452,27 +452,45 @@ struct FullGraphFixture
                                                    params.view(),
                                                    iteration_in_chunk,
                                                    stream);
-        launch_fused_pcg_update_convergence(rz_old[current_slot].view(),
-                                            rz_new[current_slot].view(),
-                                            beta.view(),
-                                            status.view(),
-                                            check_state.view(),
-                                            params.view(),
-                                            iteration_in_chunk,
-                                            stream);
         if(forced_terminal_iteration > 0)
+        {
+            launch_fused_pcg_update_convergence(rz_old[current_slot].view(),
+                                                rz_new[current_slot].view(),
+                                                beta.view(),
+                                                status.view(),
+                                                check_state.view(),
+                                                params.view(),
+                                                iteration_in_chunk,
+                                                stream);
             force_terminal_iteration_kernel<<<1, 1, 0, stream>>>(
                 status.data(), check_state.data(), params.data(), iteration_in_chunk, forced_terminal_iteration);
-        launch_fused_pcg_update_p_prepare_next(p.view(),
-                                               z.cview(),
-                                               beta.view(),
-                                               rz_new[current_slot].view(),
-                                               rz_old[next_slot].view(),
-                                               rz_new[next_slot].view(),
-                                               status.view(),
-                                               params.view(),
-                                               iteration_in_chunk,
-                                               stream);
+            launch_fused_pcg_update_p_prepare_next(p.view(),
+                                                   z.cview(),
+                                                   beta.view(),
+                                                   rz_new[current_slot].view(),
+                                                   rz_old[next_slot].view(),
+                                                   rz_new[next_slot].view(),
+                                                   status.view(),
+                                                   params.view(),
+                                                   iteration_in_chunk,
+                                                   stream);
+        }
+        else
+        {
+            launch_fused_pcg_update_convergence_p_prepare_next(
+                p.view(),
+                z.cview(),
+                rz_old[current_slot].view(),
+                rz_new[current_slot].view(),
+                beta.view(),
+                rz_old[next_slot].view(),
+                rz_new[next_slot].view(),
+                status.view(),
+                check_state.view(),
+                params.view(),
+                iteration_in_chunk,
+                stream);
+        }
     }
 
     GraphOwner capture(int iterations, int starting_slot)
@@ -800,24 +818,19 @@ struct ActualDiagonalPreconditionerFixture
             params.view(),
             iteration,
             stream);
-        launch_fused_pcg_update_convergence(rz_old[current_slot].view(),
-                                            rz_new[current_slot].view(),
-                                            beta.view(),
-                                            status.view(),
-                                            check_state.view(),
-                                            params.view(),
-                                            iteration,
-                                            stream);
-        launch_fused_pcg_update_p_prepare_next(p.view(),
-                                               z.cview(),
-                                               beta.view(),
-                                               rz_new[current_slot].view(),
-                                               rz_old[next_slot].view(),
-                                               rz_new[next_slot].view(),
-                                               status.view(),
-                                               params.view(),
-                                               iteration,
-                                               stream);
+        launch_fused_pcg_update_convergence_p_prepare_next(
+            p.view(),
+            z.cview(),
+            rz_old[current_slot].view(),
+            rz_new[current_slot].view(),
+            beta.view(),
+            rz_old[next_slot].view(),
+            rz_new[next_slot].view(),
+            status.view(),
+            check_state.view(),
+            params.view(),
+            iteration,
+            stream);
     }
 
     GraphOwner capture(int iterations)
@@ -1008,6 +1021,154 @@ TEST_CASE("fused_pcg_scalar_status_and_ping_pong", "[cuda][fused_pcg]")
         REQUIRE(terminal.status == static_cast<IndexT>(FusedPcgStatus::Converged));
         REQUIRE(terminal.iteration_in_chunk == 3);
         REQUIRE(terminal.rz == Catch::Approx(0.25));
+    }
+}
+
+TEST_CASE("fused_pcg_f03_convergence_prepare_fusion_matches_two_node_oracle",
+          "[cuda][fused_pcg][graph][f03][focused]")
+{
+    struct Result
+    {
+        std::vector<Float> p;
+        Float              beta        = 0.0;
+        Float              rz_old_next = 0.0;
+        Float              rz_new_next = 0.0;
+        IndexT             status       = 0;
+        FusedPcgCheckState check_state;
+        size_t             graph_nodes = 0;
+    };
+
+    const auto run = [](bool fused, SizeT vector_size, Float tolerance, IndexT active_iterations)
+    {
+        DeviceVector p{vector_size};
+        DeviceVector z{vector_size};
+        if(vector_size != 0)
+        {
+            std::vector<Float> host_p(vector_size);
+            std::vector<Float> host_z(vector_size);
+            for(SizeT i = 0; i < vector_size; ++i)
+            {
+                host_p[i] = Float{0.125} + Float(i % 17) * Float{0.03125};
+                host_z[i] = Float{-0.25} + Float(i % 23) * Float{0.015625};
+            }
+            p = Eigen::Map<const Eigen::VectorXd>(host_p.data(), host_p.size());
+            z = Eigen::Map<const Eigen::VectorXd>(host_z.data(), host_z.size());
+        }
+
+        muda::DeviceVar<Float> rz_old{4.0};
+        muda::DeviceVar<Float> rz_new{1.0};
+        muda::DeviceVar<Float> beta{-103.0};
+        muda::DeviceVar<Float> rz_old_next{-7.0};
+        muda::DeviceVar<Float> rz_new_next{-9.0};
+        muda::DeviceVar<IndexT> status{static_cast<IndexT>(FusedPcgStatus::Running)};
+        muda::DeviceVar<FusedPcgDeviceParams> params;
+        muda::DeviceVar<FusedPcgCheckState>   check_state;
+
+        FusedPcgDeviceParams host_params;
+        host_params.tolerance         = tolerance;
+        host_params.active_iterations = active_iterations;
+        params                        = host_params;
+        FusedPcgCheckState host_check;
+        host_check.rz                 = -11.0;
+        host_check.status             = static_cast<IndexT>(FusedPcgStatus::Running);
+        host_check.iteration_in_chunk = -13;
+        check_state                   = host_check;
+
+        cudaStream_t stream = nullptr;
+        checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        GraphOwner graph;
+        checkCudaErrors(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        if(fused)
+        {
+            launch_fused_pcg_update_convergence_p_prepare_next(p.view(),
+                                                               z.cview(),
+                                                               rz_old.view(),
+                                                               rz_new.view(),
+                                                               beta.view(),
+                                                               rz_old_next.view(),
+                                                               rz_new_next.view(),
+                                                               status.view(),
+                                                               check_state.view(),
+                                                               params.view(),
+                                                               1,
+                                                               stream);
+        }
+        else
+        {
+            launch_fused_pcg_update_convergence(rz_old.view(),
+                                                rz_new.view(),
+                                                beta.view(),
+                                                status.view(),
+                                                check_state.view(),
+                                                params.view(),
+                                                1,
+                                                stream);
+            launch_fused_pcg_update_p_prepare_next(p.view(),
+                                                   z.cview(),
+                                                   beta.view(),
+                                                   rz_new.view(),
+                                                   rz_old_next.view(),
+                                                   rz_new_next.view(),
+                                                   status.view(),
+                                                   params.view(),
+                                                   1,
+                                                   stream);
+        }
+        checkCudaErrors(cudaStreamEndCapture(stream, &graph.graph));
+        size_t graph_node_count = 0;
+        checkCudaErrors(cudaGraphGetNodes(graph.graph, nullptr, &graph_node_count));
+        checkCudaErrors(cudaGraphInstantiate(&graph.exec, graph.graph, nullptr, nullptr, 0));
+        checkCudaErrors(cudaGraphLaunch(graph.exec, stream));
+        checkCudaErrors(cudaStreamSynchronize(stream));
+
+        Result result;
+        result.p             = copy_vector(p);
+        result.beta          = copy_var(beta);
+        result.rz_old_next    = copy_var(rz_old_next);
+        result.rz_new_next    = copy_var(rz_new_next);
+        result.status         = copy_var(status);
+        result.check_state    = copy_var(check_state);
+        result.graph_nodes    = graph_node_count;
+        checkCudaErrors(cudaStreamDestroy(stream));
+        return result;
+    };
+
+    const auto require_exact = [](const Result& fused, const Result& legacy)
+    {
+        REQUIRE(fused.p == legacy.p);
+        REQUIRE(fused.beta == legacy.beta);
+        REQUIRE(fused.rz_old_next == legacy.rz_old_next);
+        REQUIRE(fused.rz_new_next == legacy.rz_new_next);
+        REQUIRE(fused.status == legacy.status);
+        REQUIRE(fused.check_state.rz == legacy.check_state.rz);
+        REQUIRE(fused.check_state.status == legacy.check_state.status);
+        REQUIRE(fused.check_state.iteration_in_chunk
+                == legacy.check_state.iteration_in_chunk);
+    };
+
+    for(const SizeT vector_size :
+        {SizeT{0}, SizeT{1}, SizeT{63}, SizeT{64}, SizeT{65}, SizeT{420}})
+    {
+        DYNAMIC_SECTION("running n=" << vector_size)
+        {
+            const auto legacy = run(false, vector_size, 0.5, 10);
+            const auto fused  = run(true, vector_size, 0.5, 10);
+            require_exact(fused, legacy);
+            REQUIRE(fused.graph_nodes == 1);
+            REQUIRE(legacy.graph_nodes == (vector_size == 0 ? 1 : 2));
+        }
+        DYNAMIC_SECTION("converged n=" << vector_size)
+        {
+            const auto legacy = run(false, vector_size, 1.0, 10);
+            const auto fused  = run(true, vector_size, 1.0, 10);
+            require_exact(fused, legacy);
+        }
+        DYNAMIC_SECTION("inactive n=" << vector_size)
+        {
+            const auto legacy = run(false, vector_size, 0.5, 0);
+            const auto fused  = run(true, vector_size, 0.5, 0);
+            require_exact(fused, legacy);
+        }
     }
 }
 
