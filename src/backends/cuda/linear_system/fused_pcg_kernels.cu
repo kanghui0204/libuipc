@@ -3,6 +3,7 @@
 #include <cub/block/block_reduce.cuh>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <uipc/common/log.h>
 
 namespace uipc::backend::cuda
@@ -10,6 +11,8 @@ namespace uipc::backend::cuda
 namespace
 {
     constexpr int PcgVectorBlockSize = 64;
+    constexpr IndexT PcgPrepareClaimed = std::numeric_limits<IndexT>::min();
+    static_assert(static_cast<IndexT>(FusedPcgStatus::Running) == 0);
 
     __device__ bool iteration_is_active(const FusedPcgDeviceParams* params, IndexT iteration_in_chunk)
     {
@@ -96,53 +99,84 @@ namespace
         IndexT                                  iteration_in_chunk)
     {
         __shared__ Float  block_beta;
-        __shared__ IndexT block_updates_p;
+        __shared__ IndexT block_running;
 
         if(threadIdx.x == 0)
         {
             const bool active = iteration_is_active(params, iteration_in_chunk);
-            const bool running =
-                active && *status == static_cast<IndexT>(FusedPcgStatus::Running);
-            block_updates_p = 0;
-            if(running)
+            block_running = 0;
+            if(active)
             {
-                const Float old_value = *rz_old;
-                const Float new_value = *rz_new;
-                const bool converged  = fabs(new_value) <= params->tolerance;
-                if(!converged)
+                const IndexT running = static_cast<IndexT>(FusedPcgStatus::Running);
+                IndexT observed = atomicCAS(status, running, PcgPrepareClaimed);
+                if(observed == running)
                 {
-                    block_beta     = new_value / old_value;
-                    block_updates_p = 1;
+                    const Float old_value = *rz_old;
+                    const Float new_value = *rz_new;
+                    const bool  converged = fabs(new_value) <= params->tolerance;
+
+                    if(converged)
+                    {
+                        check_state->rz                 = new_value;
+                        check_state->status =
+                            static_cast<IndexT>(FusedPcgStatus::Converged);
+                        check_state->iteration_in_chunk = iteration_in_chunk;
+                        __threadfence();
+                        atomicExch(status,
+                                   static_cast<IndexT>(FusedPcgStatus::Converged));
+                        observed = static_cast<IndexT>(FusedPcgStatus::Converged);
+                    }
+                    else
+                    {
+                        const Float next_beta = new_value / old_value;
+                        *beta                 = next_beta;
+
+                        check_state->rz                 = new_value;
+                        check_state->status             = running;
+                        check_state->iteration_in_chunk = iteration_in_chunk;
+
+                        // Preserve the legacy zero-length behavior: the old
+                        // prepare-next launch was skipped when p.size() == 0.
+                        if(vector_size != 0)
+                        {
+                            *rz_old_next = new_value;
+                            *rz_new_next = Float{0.0};
+                        }
+
+                        // Publish all scalar writes before the per-block
+                        // running decision. The negative value is a block
+                        // countdown; Running is restored only after every
+                        // block has consumed beta and completed its p slice.
+                        __threadfence();
+                        const IndexT countdown = -static_cast<IndexT>(gridDim.x);
+                        atomicExch(status, countdown);
+                        observed = countdown;
+                    }
+                }
+                else
+                {
+                    while(observed == PcgPrepareClaimed)
+                        observed = atomicAdd(status, IndexT{0});
                 }
 
-                if(blockIdx.x == 0)
+                if(observed < 0 && observed != PcgPrepareClaimed)
                 {
-                    if(converged)
-                        *status = static_cast<IndexT>(FusedPcgStatus::Converged);
-                    else
-                        *beta = block_beta;
-
-                    check_state->rz = new_value;
-                    check_state->status =
-                        converged ? static_cast<IndexT>(FusedPcgStatus::Converged) :
-                                    static_cast<IndexT>(FusedPcgStatus::Running);
-                    check_state->iteration_in_chunk = iteration_in_chunk;
-
-                    // Preserve the legacy zero-length behavior: the old
-                    // prepare-next launch was skipped when p.size() == 0.
-                    if(!converged && vector_size != 0)
-                    {
-                        *rz_old_next = new_value;
-                        *rz_new_next = Float{0.0};
-                    }
+                    block_beta    = *beta;
+                    block_running = 1;
                 }
             }
         }
         __syncthreads();
 
         const SizeT i = static_cast<SizeT>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if(block_updates_p && i < vector_size)
+        if(block_running && i < vector_size)
             p[i] = z[i] + block_beta * p[i];
+
+        // A block must not retire its countdown slot until every thread in
+        // that block has finished using the published decision and beta.
+        __syncthreads();
+        if(threadIdx.x == 0 && block_running)
+            atomicAdd(status, IndexT{1});
     }
 
     __global__ void identity_update_apply_dot_kernel(Float* __restrict__ x,

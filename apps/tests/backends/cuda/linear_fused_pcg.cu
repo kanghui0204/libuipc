@@ -1038,7 +1038,12 @@ TEST_CASE("fused_pcg_f03_convergence_prepare_fusion_matches_two_node_oracle",
         size_t             graph_nodes = 0;
     };
 
-    const auto run = [](bool fused, SizeT vector_size, Float tolerance, IndexT active_iterations)
+    const auto run = [](bool   fused,
+                        SizeT vector_size,
+                        Float tolerance,
+                        IndexT active_iterations,
+                        SizeT launch_count = 1,
+                        bool verify_public_running = false)
     {
         DeviceVector p{vector_size};
         DeviceVector z{vector_size};
@@ -1118,8 +1123,16 @@ TEST_CASE("fused_pcg_f03_convergence_prepare_fusion_matches_two_node_oracle",
         size_t graph_node_count = 0;
         checkCudaErrors(cudaGraphGetNodes(graph.graph, nullptr, &graph_node_count));
         checkCudaErrors(cudaGraphInstantiate(&graph.exec, graph.graph, nullptr, nullptr, 0));
-        checkCudaErrors(cudaGraphLaunch(graph.exec, stream));
-        checkCudaErrors(cudaStreamSynchronize(stream));
+        for(SizeT launch = 0; launch < launch_count; ++launch)
+        {
+            checkCudaErrors(cudaGraphLaunch(graph.exec, stream));
+            checkCudaErrors(cudaStreamSynchronize(stream));
+            if(verify_public_running)
+            {
+                REQUIRE(copy_var(status)
+                        == static_cast<IndexT>(FusedPcgStatus::Running));
+            }
+        }
 
         Result result;
         result.p             = copy_vector(p);
@@ -1169,6 +1182,27 @@ TEST_CASE("fused_pcg_f03_convergence_prepare_fusion_matches_two_node_oracle",
             const auto fused  = run(true, vector_size, 0.5, 0);
             require_exact(fused, legacy);
         }
+    }
+
+    SECTION("multi-block running publication survives repeated graph launches")
+    {
+        constexpr SizeT ActualFullAbdDofCount = 420;
+        constexpr SizeT RepeatCount           = 257;
+        const auto legacy = run(false,
+                                ActualFullAbdDofCount,
+                                0.5,
+                                10,
+                                RepeatCount,
+                                true);
+        const auto fused = run(true,
+                               ActualFullAbdDofCount,
+                               0.5,
+                               10,
+                               RepeatCount,
+                               true);
+        require_exact(fused, legacy);
+        REQUIRE(fused.graph_nodes == 1);
+        REQUIRE(legacy.graph_nodes == 2);
     }
 }
 
