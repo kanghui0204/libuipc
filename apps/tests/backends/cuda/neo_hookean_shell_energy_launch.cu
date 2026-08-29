@@ -1,4 +1,5 @@
 #include <app/app.h>
+#include <type_define.h>
 #include <finite_element/constitutions/neo_hookean_shell_2d_function.h>
 #include <muda/buffer/device_buffer.h>
 
