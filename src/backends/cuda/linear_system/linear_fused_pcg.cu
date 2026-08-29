@@ -233,25 +233,19 @@ void LinearFusedPCG::launch_graph_iteration(muda::DenseVectorView<Float> x,
                                iteration_in_chunk,
                                stream);
 
-    launch_fused_pcg_update_convergence(resources.graph_rz_old[current_slot].view(),
-                                        resources.graph_rz_new[current_slot].view(),
-                                        resources.beta.view(),
-                                        d_converged.view(),
-                                        resources.check_state.view(),
-                                        resources.device_params.view(),
-                                        iteration_in_chunk,
-                                        stream);
-
-    launch_fused_pcg_update_p_prepare_next(p.view(),
-                                           z.cview(),
-                                           resources.beta.view(),
-                                           resources.graph_rz_new[current_slot].view(),
-                                           resources.graph_rz_old[next_slot].view(),
-                                           resources.graph_rz_new[next_slot].view(),
-                                           d_converged.view(),
-                                           resources.device_params.view(),
-                                           iteration_in_chunk,
-                                           stream);
+    launch_fused_pcg_update_convergence_p_prepare_next(
+        p.view(),
+        z.cview(),
+        resources.graph_rz_old[current_slot].view(),
+        resources.graph_rz_new[current_slot].view(),
+        resources.beta.view(),
+        resources.graph_rz_old[next_slot].view(),
+        resources.graph_rz_new[next_slot].view(),
+        d_converged.view(),
+        resources.check_state.view(),
+        resources.device_params.view(),
+        iteration_in_chunk,
+        stream);
 }
 
 SizeT LinearFusedPCG::graph_fused_pcg(muda::DenseVectorView<Float>  x,
