@@ -1,4 +1,5 @@
 #include <type_define.h>
+#include <app/app.h>
 #include <collision_detection/info_stackless_bvh.h>
 #include <muda/buffer.h>
 #include <algorithm>
@@ -37,10 +38,12 @@ void check_same_pairs(PairSet lhs, PairSet rhs)
     }
 }
 
-auto node_pred(muda::CBuffer2DView<IndexT> cmts)
+struct NodePred
 {
-    return [cmts = cmts.viewer().name("cmts")] __device__(
-               const InfoStacklessBVH::NodePredInfo& info)
+    muda::CDense2D<IndexT> cmts;
+
+    MUDA_GENERIC bool operator()(
+        const InfoStacklessBVH::NodePredInfo& info) const
     {
         constexpr IndexT invalid = static_cast<IndexT>(-1);
         bool bid_cull = info.query_bid != invalid && info.node_bid != invalid
@@ -48,16 +51,28 @@ auto node_pred(muda::CBuffer2DView<IndexT> cmts)
         bool cid_cull = info.query_cid != invalid && info.node_cid != invalid
                         && !cmts(info.query_cid, info.node_cid);
         return !(bid_cull || cid_cull);
-    };
-}
+    }
+};
 
-auto leaf_pred(muda::CBuffer2DView<IndexT> cmts)
+struct LeafPred
 {
-    return [cmts = cmts.viewer().name("cmts")] __device__(
-               const InfoStacklessBVH::LeafPredInfo& info)
+    muda::CDense2D<IndexT> cmts;
+
+    MUDA_GENERIC bool operator()(
+        const InfoStacklessBVH::LeafPredInfo& info) const
     {
         return info.bid_i != info.bid_j && cmts(info.cid_i, info.cid_j);
-    };
+    }
+};
+
+NodePred node_pred(muda::CBuffer2DView<IndexT> cmts)
+{
+    return NodePred{cmts.viewer().name("cmts")};
+}
+
+LeafPred leaf_pred(muda::CBuffer2DView<IndexT> cmts)
+{
+    return LeafPred{cmts.viewer().name("cmts")};
 }
 
 PairSet detect_pairs(InfoStacklessBVH&          bvh,
