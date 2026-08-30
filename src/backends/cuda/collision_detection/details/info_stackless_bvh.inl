@@ -485,14 +485,19 @@ inline void InfoStacklessBVH::Impl::reorderNode(int int_size)
         .apply(int_size + 1,
                [int_size,
                 _lvs_lca     = ext_lca.viewer().name("lvs_lca"),
+                _lvs_par     = ext_par.viewer().name("lvs_par"),
                 _lvs_box     = ext_aabb.viewer().name("lvs_box"),
                 _lvs_bid     = ext_bid.viewer().name("lvs_bid"),
                 _lvs_cid     = ext_cid.viewer().name("lvs_cid"),
                 _tk_map      = tkMap.viewer().name("tk_map"),
                 _int_lc      = int_lc.viewer().name("int_lc"),
+                _int_rc      = int_rc.viewer().name("int_rc"),
+                _int_par     = int_par.viewer().name("int_par"),
                 _int_mark    = int_mark.viewer().name("int_mark"),
                 _int_range_y = int_range_y.viewer().name("int_range_y"),
                 _self_max_rank = self_max_rank.viewer().name("self_max_rank"),
+                _refit_parent = refit_parent.viewer().name("refit_parent"),
+                _refit_right = refit_right_child.viewer().name("refit_right"),
                 _int_box     = int_aabb.viewer().name("int_box"),
                 _int_bid     = int_bid.viewer().name("int_bid"),
                 _int_cid     = int_cid.viewer().name("int_cid"),
@@ -513,6 +518,7 @@ inline void InfoStacklessBVH::Impl::reorderNode(int int_size)
                    leaf.bid               = _lvs_bid(idx);
                    leaf.cid               = _lvs_cid(idx);
                    _nodes(idx + int_size) = leaf;
+                   _refit_parent(idx + int_size) = int_size == 0 ? -1 : _lvs_par(idx);
 
                    if(idx >= int_size)
                        return;
@@ -522,6 +528,11 @@ inline void InfoStacklessBVH::Impl::reorderNode(int int_size)
                    uint32_t m      = _int_mark(idx);
                    _self_max_rank(new_id) = _int_range_y(idx);
                    n.lc = (m & 1) ? _int_lc(idx) + int_size : _tk_map(_int_lc(idx));
+                   _refit_right(new_id) =
+                       (m & 2) ? _int_rc(idx) + int_size : _tk_map(_int_rc(idx));
+                   int old_parent = _int_par(idx);
+                   _refit_parent(new_id) =
+                       old_parent == -1 ? -1 : _tk_map(old_parent);
                    n.bound = _int_box(idx);
                    int ie  = _lvs_lca(_int_range_y(idx) + 1);
                    if(ie == -1)
@@ -579,6 +590,9 @@ inline void InfoStacklessBVH::Impl::build(muda::CBufferView<AABB>   aabbs,
     int_bid.resize(num_internal);
     int_cid.resize(num_internal);
     nodes.resize(num_nodes);
+    refit_parent.resize(num_nodes);
+    refit_right_child.resize(num_internal);
+    refit_arrivals.resize(num_internal);
 
     thrust::fill(flags.begin(), flags.end(), 0);
     thrust::fill(thrust::device, ext_mark.begin(), ext_mark.end(), 7);
@@ -601,6 +615,101 @@ inline void InfoStacklessBVH::Impl::build(muda::CBufferView<AABB>   aabbs,
     thrust::fill(null_stream, ext_lca.begin() + num_objs, ext_lca.begin() + num_objs + 1, -1);
     updateBvhExtNodeLinks(num_objs);
     reorderNode(num_internal);
+}
+
+inline bool InfoStacklessBVH::Impl::refit(muda::CBufferView<AABB>   aabbs,
+                                          muda::CBufferView<IndexT> _bids,
+                                          muda::CBufferView<IndexT> _cids)
+{
+    using namespace muda;
+    constexpr IndexT invalid = static_cast<IndexT>(-1);
+
+    auto num_objs = aabbs.size();
+    if(num_objs != objs.size())
+        return false;
+
+    bool has_info = _bids.size() == num_objs && _cids.size() == num_objs;
+    if(!has_info)
+        return false;
+
+    if(num_objs == 0)
+    {
+        objs = aabbs;
+        bids = _bids;
+        cids = _cids;
+        return true;
+    }
+
+    auto num_internal = num_objs - 1;
+    auto num_nodes    = num_objs * 2 - 1;
+    if(nodes.size() != num_nodes || ext_idx.size() != num_objs
+       || ext_aabb.size() != num_objs || ext_bid.size() != num_objs
+       || ext_cid.size() != num_objs || refit_parent.size() != num_nodes
+       || refit_right_child.size() != num_internal
+       || refit_arrivals.size() != num_internal)
+        return false;
+
+    objs = aabbs;
+    bids = _bids;
+    cids = _cids;
+
+    auto null_stream = thrust::cuda::par_nosync.on(nullptr);
+    thrust::fill(null_stream, refit_arrivals.begin(), refit_arrivals.end(), 0);
+
+    ParallelFor()
+        .file_line(__FILE__, __LINE__)
+        .apply(num_objs,
+               [int_size = static_cast<int>(num_internal),
+                _aabbs   = aabbs.viewer().name("aabbs"),
+                _bids    = _bids.viewer().name("bids"),
+                _cids    = _cids.viewer().name("cids"),
+                _lvs_idx = ext_idx.viewer().name("lvs_idx"),
+                _lvs_box = ext_aabb.viewer().name("lvs_box"),
+                _lvs_bid = ext_bid.viewer().name("lvs_bid"),
+                _lvs_cid = ext_cid.viewer().name("lvs_cid"),
+                _nodes   = nodes.viewer().name("nodes"),
+                _parent  = refit_parent.viewer().name("parent"),
+                _right   = refit_right_child.viewer().name("right"),
+                _arrivals = refit_arrivals.viewer().name("arrivals")] __device__(int rank)
+               {
+                   int raw_id  = _lvs_idx(rank);
+                   int leaf_id = int_size + rank;
+
+                   Node leaf  = _nodes(leaf_id);
+                   leaf.bound = _aabbs(raw_id);
+                   leaf.bid   = _bids(raw_id);
+                   leaf.cid   = _cids(raw_id);
+                   _nodes(leaf_id) = leaf;
+                   _lvs_box(rank)  = leaf.bound;
+                   _lvs_bid(rank)  = leaf.bid;
+                   _lvs_cid(rank)  = leaf.cid;
+
+                   __threadfence();
+                   int parent = _parent(leaf_id);
+                   while(parent != -1)
+                   {
+                       // The first completed child stops here. The second child
+                       // observes both child nodes, updates the parent, and
+                       // continues toward the root.
+                       if(atomicAdd(&_arrivals(parent), 1) == 0)
+                           break;
+
+                       __threadfence();
+                       Node node  = _nodes(parent);
+                       Node left  = _nodes(node.lc);
+                       Node right = _nodes(_right(parent));
+                       node.bound = left.bound;
+                       node.bound.extend(right.bound);
+                       node.bid = left.bid == right.bid ? left.bid : invalid;
+                       node.cid = left.cid == right.cid ? left.cid : invalid;
+                       _nodes(parent) = node;
+
+                       __threadfence();
+                       parent = _parent(parent);
+                   }
+               });
+
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +1049,23 @@ inline void InfoStacklessBVH::build(muda::CBufferView<AABB> aabbs)
     m_BIDs  = {};
     m_CIDs  = {};
     m_impl.build(aabbs, {}, {});
+}
+
+inline bool InfoStacklessBVH::refit(muda::CBufferView<AABB>   aabbs,
+                                    muda::CBufferView<IndexT> BIDs,
+                                    muda::CBufferView<IndexT> CIDs)
+{
+    if(aabbs.size() != m_aabbs.size() || aabbs.size() != BIDs.size()
+       || aabbs.size() != CIDs.size())
+        return false;
+
+    if(!m_impl.refit(aabbs, BIDs, CIDs))
+        return false;
+
+    m_aabbs = aabbs;
+    m_BIDs  = BIDs;
+    m_CIDs  = CIDs;
+    return true;
 }
 
 // detect() with NodePred / LeafPred: wrapper passes pre-loaded bid/cid to NodePredInfo

@@ -117,6 +117,13 @@ class InfoStacklessBVH
                muda::CBufferView<IndexT> CIDs);
     void build(muda::CBufferView<AABB> aabbs);
 
+    // Reuse the existing Morton topology and update leaf/internal bounds and
+    // informative metadata. Returns false without modifying the tree when the
+    // primitive count or cached topology is incompatible.
+    bool refit(muda::CBufferView<AABB>   aabbs,
+               muda::CBufferView<IndexT> BIDs,
+               muda::CBufferView<IndexT> CIDs);
+
     template <typename NodePred, typename LeafPred>
     void detect(muda::CBuffer2DView<IndexT> cmts, NodePred np, LeafPred lp, QueryBuffer& qbuffer);
 
@@ -150,6 +157,9 @@ class InfoStacklessBVH
         void        reorderNode(int intSize);
         void        propagateInformativeMetadata(int intSize);
         void        build(muda::CBufferView<AABB>   aabbs,
+                          muda::CBufferView<IndexT> bids,
+                          muda::CBufferView<IndexT> cids);
+        bool        refit(muda::CBufferView<AABB>   aabbs,
                           muda::CBufferView<IndexT> bids,
                           muda::CBufferView<IndexT> cids);
 
@@ -198,6 +208,11 @@ class InfoStacklessBVH
         // Maximum Morton-sorted leaf rank for each reordered internal node.
         // Used only by stacklessSelf to skip the already-covered half-tree.
         muda::DeviceVector<int>      self_max_rank;
+        // Stable reordered-tree links used only by refit. Traversal layout and
+        // self_max_rank remain unchanged.
+        muda::DeviceVector<int>      refit_parent;
+        muda::DeviceVector<int>      refit_right_child;
+        muda::DeviceVector<int>      refit_arrivals;
         muda::DeviceVector<uint32_t> int_mark;
         muda::DeviceVector<AABB>     int_aabb;
         muda::DeviceVector<IndexT>   ext_bid;

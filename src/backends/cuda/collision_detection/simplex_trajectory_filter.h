@@ -72,12 +72,14 @@ class SimplexTrajectoryFilter : public TrajectoryFilter
         using BaseInfo::BaseInfo;
 
         Float alpha() const noexcept { return m_alpha; }
+        bool reuse_bvh_topology() const noexcept { return m_reuse_bvh_topology; }
 
         muda::CBufferView<Vector3> displacements() const noexcept;
 
       private:
         friend class SimplexTrajectoryFilter;
-        Float m_alpha = 0.0;
+        Float m_alpha              = 0.0;
+        bool  m_reuse_bvh_topology = false;
     };
 
     class FilterActiveInfo : public BaseInfo

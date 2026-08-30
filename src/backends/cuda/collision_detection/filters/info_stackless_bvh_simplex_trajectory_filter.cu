@@ -270,14 +270,22 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::detect(DetectInfo& info)
                    cids(i)  = contact_ids(fI[0]);
                });
 
-    lbvh_E.build(edge_aabbs, edge_bids, edge_cids);
-    lbvh_T.build(triangle_aabbs, triangle_bids, triangle_cids);
+    if(!info.reuse_bvh_topology()
+       || !lbvh_E.refit(edge_aabbs, edge_bids, edge_cids))
+        lbvh_E.build(edge_aabbs, edge_bids, edge_cids);
+    if(!info.reuse_bvh_topology()
+       || !lbvh_T.refit(triangle_aabbs, triangle_bids, triangle_cids))
+        lbvh_T.build(triangle_aabbs, triangle_bids, triangle_cids);
 
     if(codimVs.size() > 0)
     {
         // Use AllP to query CodimP
         {
-            lbvh_CodimP.build(codim_point_aabbs, codim_point_bids, codim_point_cids);
+            if(!info.reuse_bvh_topology()
+               || !lbvh_CodimP.refit(
+                   codim_point_aabbs, codim_point_bids, codim_point_cids))
+                lbvh_CodimP.build(
+                    codim_point_aabbs, codim_point_bids, codim_point_cids);
 
             muda::KernelLabel label{__FUNCTION__, __FILE__, __LINE__};
             lbvh_CodimP.query(
