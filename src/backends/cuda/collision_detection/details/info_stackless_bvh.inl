@@ -479,7 +479,6 @@ inline void InfoStacklessBVH::Impl::updateBvhExtNodeLinks(int size)
 inline void InfoStacklessBVH::Impl::reorderNode(int int_size)
 {
     using namespace muda;
-    constexpr IndexT invalid = static_cast<IndexT>(-1);
     ParallelFor()
         .file_line(__FILE__, __LINE__)
         .apply(int_size + 1,
@@ -518,7 +517,11 @@ inline void InfoStacklessBVH::Impl::reorderNode(int int_size)
                    leaf.bid               = _lvs_bid(idx);
                    leaf.cid               = _lvs_cid(idx);
                    _nodes(idx + int_size) = leaf;
-                   _refit_parent(idx + int_size) = int_size == 0 ? -1 : _lvs_par(idx);
+                   if(int_size == 0)
+                       _refit_parent(idx + int_size) = -1;
+                   else
+                       _refit_parent(idx + int_size) =
+                           static_cast<int>(_lvs_par(idx));
 
                    if(idx >= int_size)
                        return;
