@@ -92,7 +92,7 @@ class InfoStacklessBVH
         muda::DeviceBuffer<int>          m_querySortedId;
         muda::DeviceVar<int>             m_cpNum;
 
-        void build(muda::CBufferView<AABB> aabbs);
+        void build(muda::CBufferView<AABB> aabbs, bool reuse_order = false);
     };
 
     struct Node
@@ -134,7 +134,8 @@ class InfoStacklessBVH
                muda::CBuffer2DView<IndexT> cmts,
                NodePred                    np,
                LeafPred                    lp,
-               QueryBuffer&                qbuffer);
+               QueryBuffer&                qbuffer,
+               bool                        reuse_query_order = false);
 
     Config&       config() noexcept { return m_impl.config; }
     const Config& config() const noexcept { return m_impl.config; }

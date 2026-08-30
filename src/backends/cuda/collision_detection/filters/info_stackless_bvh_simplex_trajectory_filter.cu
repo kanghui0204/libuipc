@@ -359,7 +359,8 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::detect(DetectInfo& info)
 
                     return true;
                 },
-                candidate_AllP_CodimP_pairs);
+                candidate_AllP_CodimP_pairs,
+                info.reuse_bvh_topology());
         }
 
         // Use CodimP to query AllE
@@ -441,7 +442,8 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::detect(DetectInfo& info)
 
                     return true;
                 },
-                candidate_CodimP_AllE_pairs);
+                candidate_CodimP_AllE_pairs,
+                info.reuse_bvh_topology());
         }
     }
 
@@ -620,7 +622,8 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::detect(DetectInfo& info)
 
                 return true;
             },
-            candidate_AllP_AllT_pairs);
+            candidate_AllP_AllT_pairs,
+            info.reuse_bvh_topology());
     }
 }
 

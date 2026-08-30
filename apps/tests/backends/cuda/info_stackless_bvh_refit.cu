@@ -114,6 +114,30 @@ PairSet query_pairs(InfoStacklessBVH&          bvh,
     return result;
 }
 
+PairSet query_pairs(InfoStacklessBVH&              bvh,
+                    muda::CBufferView<AABB>        query_aabbs,
+                    muda::CBufferView<IndexT>      query_bids,
+                    muda::CBufferView<IndexT>      query_cids,
+                    muda::CBuffer2DView<IndexT>    cmts,
+                    InfoStacklessBVH::QueryBuffer& pairs,
+                    bool                           reuse_query_order)
+{
+    bvh.query(query_aabbs,
+              query_bids,
+              query_cids,
+              cmts,
+              node_pred(cmts),
+              leaf_pred(cmts),
+              pairs,
+              reuse_query_order);
+
+    PairSet result;
+    result.values.resize(pairs.size());
+    if(!result.values.empty())
+        pairs.view().copy_to(result.values.data());
+    return result;
+}
+
 AABB box_at(double x, double radius)
 {
     AABB box;
@@ -277,7 +301,7 @@ void compare_full_build_and_refit(const Inputs& initial,
 }
 }  // namespace test_info_stackless_bvh_refit
 
-TEST_CASE("info_stackless_bvh_refit", "[LS11][line_search][bvh]")
+TEST_CASE("info_stackless_bvh_refit", "[LS11][LS13][line_search][bvh]")
 {
     using namespace test_info_stackless_bvh_refit;
 
@@ -353,6 +377,73 @@ TEST_CASE("info_stackless_bvh_refit", "[LS11][line_search][bvh]")
         auto changed = swept_inputs(9, 0.0);
         upload(changed, aabbs, bids, cids);
         CHECK_FALSE(bvh.refit(aabbs, bids, cids));
+    }
+
+    SECTION("reuse_query_order_and_count_change")
+    {
+        auto target = swept_inputs(96, 0.0);
+        DeviceBuffer<AABB>   target_aabbs;
+        DeviceBuffer<IndexT> target_bids;
+        DeviceBuffer<IndexT> target_cids;
+        upload(target, target_aabbs, target_bids, target_cids);
+        InfoStacklessBVH bvh;
+        bvh.build(target_aabbs, target_bids, target_cids);
+
+        DeviceBuffer<AABB>   query_aabbs;
+        DeviceBuffer<IndexT> query_bids;
+        DeviceBuffer<IndexT> query_cids;
+        InfoStacklessBVH::QueryBuffer reused;
+        reused.reserve(1);
+
+        // Prepare a deliberately poor order, then move the same query IDs so
+        // their freshly computed Morton order is very different.
+        upload(initial_inputs(33), query_aabbs, query_bids, query_cids);
+        query_pairs(bvh,
+                    query_aabbs,
+                    query_bids,
+                    query_cids,
+                    d_cmts.view(),
+                    reused,
+                    false);
+
+        upload(swept_inputs(33, 0.04), query_aabbs, query_bids, query_cids);
+        auto reused_pairs = query_pairs(bvh,
+                                        query_aabbs,
+                                        query_bids,
+                                        query_cids,
+                                        d_cmts.view(),
+                                        reused,
+                                        true);
+
+        InfoStacklessBVH::QueryBuffer rebuilt;
+        rebuilt.reserve(1);
+        auto rebuilt_pairs = query_pairs(bvh,
+                                         query_aabbs,
+                                         query_bids,
+                                         query_cids,
+                                         d_cmts.view(),
+                                         rebuilt,
+                                         false);
+        CHECK(check_same_pairs(reused_pairs, rebuilt_pairs) > 1);
+
+        // A changed count must ignore the cached order and rebuild it.
+        upload(swept_inputs(34, 0.02), query_aabbs, query_bids, query_cids);
+        auto changed_reused = query_pairs(bvh,
+                                          query_aabbs,
+                                          query_bids,
+                                          query_cids,
+                                          d_cmts.view(),
+                                          reused,
+                                          true);
+        InfoStacklessBVH::QueryBuffer changed_rebuilt;
+        auto changed_fresh = query_pairs(bvh,
+                                         query_aabbs,
+                                         query_bids,
+                                         query_cids,
+                                         d_cmts.view(),
+                                         changed_rebuilt,
+                                         false);
+        check_same_pairs(changed_reused, changed_fresh);
     }
 
     SECTION("cross_cta_metadata_transitions_and_overflow")
