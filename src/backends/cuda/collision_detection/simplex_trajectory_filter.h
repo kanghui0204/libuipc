@@ -83,7 +83,13 @@ class SimplexTrajectoryFilter : public TrajectoryFilter
     class FilterActiveInfo : public BaseInfo
     {
       public:
-        using BaseInfo::BaseInfo;
+        FilterActiveInfo(Impl* impl, bool batch_active_counts) noexcept
+            : BaseInfo(impl)
+            , m_batch_active_counts(batch_active_counts)
+        {
+        }
+
+        bool batch_active_counts() const noexcept { return m_batch_active_counts; }
 
         /**
          * @brief Candidate point-triangle pairs.
@@ -101,6 +107,9 @@ class SimplexTrajectoryFilter : public TrajectoryFilter
          * @brief Candidate point-point pairs.
          */
         void PPs(muda::CBufferView<Vector2i> PPs) noexcept;
+
+      private:
+        bool m_batch_active_counts = false;
     };
 
     class FilterTOIInfo : public DetectInfo

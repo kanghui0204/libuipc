@@ -1026,38 +1026,75 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::filter_active(FilterActiveIn
         PTs.resize(temp_PTs.size());
         EEs.resize(temp_EEs.size());
 
+        const bool batch_active_counts = info.batch_active_counts();
+        if(batch_active_counts)
+            batched_active_count_readback.prepare();
+
+        IndexT* PP_count_output = batch_active_counts
+                                      ? batched_active_count_readback.output(
+                                            ActiveContactCountSlot::PP)
+                                      : selected_PP_count.data();
+        IndexT* PE_count_output = batch_active_counts
+                                      ? batched_active_count_readback.output(
+                                            ActiveContactCountSlot::PE)
+                                      : selected_PE_count.data();
+        IndexT* PT_count_output = batch_active_counts
+                                      ? batched_active_count_readback.output(
+                                            ActiveContactCountSlot::PT)
+                                      : selected_PT_count.data();
+        IndexT* EE_count_output = batch_active_counts
+                                      ? batched_active_count_readback.output(
+                                            ActiveContactCountSlot::EE)
+                                      : selected_EE_count.data();
+
         DeviceSelect().If(temp_PPs.data(),
                           PPs.data(),
-                          selected_PP_count.data(),
+                          PP_count_output,
                           temp_PPs.size(),
                           [] CUB_RUNTIME_FUNCTION(const Vector2i& PP)
                           { return PP(0) != -1; });
 
         DeviceSelect().If(temp_PEs.data(),
                           PEs.data(),
-                          selected_PE_count.data(),
+                          PE_count_output,
                           temp_PEs.size(),
                           [] CUB_RUNTIME_FUNCTION(const Vector3i& PE)
                           { return PE(0) != -1; });
 
         DeviceSelect().If(temp_PTs.data(),
                           PTs.data(),
-                          selected_PT_count.data(),
+                          PT_count_output,
                           temp_PTs.size(),
                           [] CUB_RUNTIME_FUNCTION(const Vector4i& PT)
                           { return PT(0) != -1; });
 
         DeviceSelect().If(temp_EEs.data(),
                           EEs.data(),
-                          selected_EE_count.data(),
+                          EE_count_output,
                           temp_EEs.size(),
                           [] CUB_RUNTIME_FUNCTION(const Vector4i& EE)
                           { return EE(0) != -1; });
 
-        IndexT PP_count = selected_PP_count;
-        IndexT PE_count = selected_PE_count;
-        IndexT PT_count = selected_PT_count;
-        IndexT EE_count = selected_EE_count;
+        IndexT PP_count;
+        IndexT PE_count;
+        IndexT PT_count;
+        IndexT EE_count;
+
+        if(batch_active_counts)
+        {
+            const auto& counts = batched_active_count_readback.read();
+            PP_count = counts[static_cast<SizeT>(ActiveContactCountSlot::PP)];
+            PE_count = counts[static_cast<SizeT>(ActiveContactCountSlot::PE)];
+            PT_count = counts[static_cast<SizeT>(ActiveContactCountSlot::PT)];
+            EE_count = counts[static_cast<SizeT>(ActiveContactCountSlot::EE)];
+        }
+        else
+        {
+            PP_count = selected_PP_count;
+            PE_count = selected_PE_count;
+            PT_count = selected_PT_count;
+            EE_count = selected_EE_count;
+        }
 
         PPs.resize(PP_count);
         PEs.resize(PE_count);

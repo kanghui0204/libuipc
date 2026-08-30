@@ -40,15 +40,19 @@ class GlobalTrajectoryFilter final : public SimSystem
     class FilterActiveInfo
     {
       public:
-        FilterActiveInfo(Impl* impl) noexcept
+        FilterActiveInfo(Impl* impl, bool batch_active_counts) noexcept
             : m_impl(impl)
+            , m_batch_active_counts(batch_active_counts)
         {
         }
+
+        bool batch_active_counts() const noexcept { return m_batch_active_counts; }
 
 
       private:
         friend class GlobalTrajectoryFilter;
         Impl* m_impl;
+        bool  m_batch_active_counts = false;
     };
 
     class LabelActiveVerticesInfo
@@ -102,7 +106,7 @@ class GlobalTrajectoryFilter final : public SimSystem
     friend class SimEngine;
     friend class ContactExporterManager;
     void detect(Float alpha);  // called by SimEngine and ContactExporterManager
-    void filter_active();      // called by SimEngine and ContactExporterManager
+    void filter_active(bool batch_active_counts = false);  // called by SimEngine and ContactExporterManager
 
     Float filter_toi(Float alpha);       // only called by SimEngine
     void  record_friction_candidates();  // only called by SimEngine
