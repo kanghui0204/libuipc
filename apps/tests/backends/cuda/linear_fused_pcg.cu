@@ -1,7 +1,7 @@
 #include <app/app.h>
 
 #include <linear_system/diag_linear_subsystem.h>
-#include <linear_system/fused_pcg_kernels.h>
+#include "../../../../src/backends/cuda/linear_system/fused_pcg_kernels.h"
 #include <linear_system/global_preconditioner.h>
 #include <linear_system/local_preconditioner.h>
 #include <linear_system/spmv.h>
@@ -1011,6 +1011,128 @@ TEST_CASE("fused_pcg_scalar_status_and_ping_pong", "[cuda][fused_pcg]")
     }
 }
 
+TEST_CASE("fused_pcg_combined_convergence_update_p", "[cuda][fused_pcg][graph][fused_tail]")
+{
+    muda::DeviceVar<Float> rz_old{4.0};
+    muda::DeviceVar<Float> beta{-3.0};
+    muda::DeviceVar<Float> rz_new{1.0};
+    muda::DeviceVar<Float> rz_old_next{-7.0};
+    muda::DeviceVar<Float> rz_new_next{-9.0};
+    muda::DeviceVar<IndexT> status{static_cast<IndexT>(FusedPcgStatus::Running)};
+    muda::DeviceVar<FusedPcgDeviceParams> params;
+    muda::DeviceVar<FusedPcgCheckState>   check_state;
+
+    FusedPcgDeviceParams host_params;
+    host_params.tolerance         = 0.5;
+    host_params.active_iterations = 10;
+    params                        = host_params;
+
+    DeviceVector    p{3};
+    DeviceVector    z{3};
+    Eigen::VectorXd host_p(3);
+    Eigen::VectorXd host_z(3);
+    host_p << 1.0, 2.0, 3.0;
+    host_z << 4.0, 5.0, 6.0;
+    p = host_p;
+    z = host_z;
+
+    launch_fused_pcg_convergence_update_p_prepare_next(p.view(),
+                                                       z.cview(),
+                                                       rz_old.view(),
+                                                       rz_new.view(),
+                                                       beta.view(),
+                                                       rz_old_next.view(),
+                                                       rz_new_next.view(),
+                                                       status.view(),
+                                                       check_state.view(),
+                                                       params.view(),
+                                                       1,
+                                                       nullptr);
+    require_near(copy_vector(p), {4.25, 5.5, 6.75}, 1e-14, 1e-14);
+    REQUIRE(copy_var(beta) == Catch::Approx(0.25));
+    REQUIRE(copy_var(rz_old_next) == Catch::Approx(1.0));
+    REQUIRE(copy_var(rz_new_next) == Catch::Approx(0.0));
+    auto running_check = copy_var(check_state);
+    REQUIRE(running_check.status == static_cast<IndexT>(FusedPcgStatus::Running));
+    REQUIRE(running_check.iteration_in_chunk == 1);
+    REQUIRE(running_check.rz == Catch::Approx(1.0));
+
+    SECTION("converged iteration leaves p and next slots unchanged")
+    {
+        p           = host_p;
+        rz_new      = 0.25;
+        rz_old_next = -7.0;
+        rz_new_next = -9.0;
+        status      = static_cast<IndexT>(FusedPcgStatus::Running);
+        launch_fused_pcg_convergence_update_p_prepare_next(p.view(),
+                                                           z.cview(),
+                                                           rz_old.view(),
+                                                           rz_new.view(),
+                                                           beta.view(),
+                                                           rz_old_next.view(),
+                                                           rz_new_next.view(),
+                                                           status.view(),
+                                                           check_state.view(),
+                                                           params.view(),
+                                                           3,
+                                                           nullptr);
+        require_near(copy_vector(p), {1.0, 2.0, 3.0}, 0.0, 0.0);
+        REQUIRE(copy_var(rz_old_next) == Catch::Approx(-7.0));
+        REQUIRE(copy_var(rz_new_next) == Catch::Approx(-9.0));
+        const auto terminal = copy_var(check_state);
+        REQUIRE(terminal.status == static_cast<IndexT>(FusedPcgStatus::Converged));
+        REQUIRE(terminal.iteration_in_chunk == 3);
+        REQUIRE(terminal.rz == Catch::Approx(0.25));
+
+        rz_new = 2.0;
+        launch_fused_pcg_convergence_update_p_prepare_next(p.view(),
+                                                           z.cview(),
+                                                           rz_old.view(),
+                                                           rz_new.view(),
+                                                           beta.view(),
+                                                           rz_old_next.view(),
+                                                           rz_new_next.view(),
+                                                           status.view(),
+                                                           check_state.view(),
+                                                           params.view(),
+                                                           4,
+                                                           nullptr);
+        require_near(copy_vector(p), {1.0, 2.0, 3.0}, 0.0, 0.0);
+        REQUIRE(copy_var(check_state).iteration_in_chunk == 3);
+    }
+
+    SECTION("inactive iteration leaves all state unchanged")
+    {
+        p           = host_p;
+        rz_old_next = -7.0;
+        rz_new_next = -9.0;
+        status      = static_cast<IndexT>(FusedPcgStatus::Running);
+        FusedPcgCheckState sentinel;
+        sentinel.rz     = -11.0;
+        sentinel.status = static_cast<IndexT>(FusedPcgStatus::Running);
+        sentinel.iteration_in_chunk = 7;
+        check_state                 = sentinel;
+        launch_fused_pcg_convergence_update_p_prepare_next(p.view(),
+                                                           z.cview(),
+                                                           rz_old.view(),
+                                                           rz_new.view(),
+                                                           beta.view(),
+                                                           rz_old_next.view(),
+                                                           rz_new_next.view(),
+                                                           status.view(),
+                                                           check_state.view(),
+                                                           params.view(),
+                                                           11,
+                                                           nullptr);
+        require_near(copy_vector(p), {1.0, 2.0, 3.0}, 0.0, 0.0);
+        REQUIRE(copy_var(rz_old_next) == Catch::Approx(-7.0));
+        REQUIRE(copy_var(rz_new_next) == Catch::Approx(-9.0));
+        const auto unchanged = copy_var(check_state);
+        REQUIRE(unchanged.rz == Catch::Approx(-11.0));
+        REQUIRE(unchanged.iteration_in_chunk == 7);
+    }
+}
+
 TEST_CASE("fused_pcg_graph_5_and_10_match_reference", "[cuda][fused_pcg][graph]")
 {
     FullGraphFixture fixture;
@@ -1189,102 +1311,232 @@ TEST_CASE("actual_abd_fem_fused_preconditioners_match_legacy_for_forced_iteratio
 TEST_CASE("full_abd_fused_update_apply_dot_matches_dense_reference",
           "[cuda][fused_pcg][graph][preconditioner][full_abd_graph]")
 {
-    constexpr int ScalarCount = 24;
-
-    std::vector<Float> full_inverse(ScalarCount * ScalarCount, 0.0);
-    for(int row = 0; row < ScalarCount; ++row)
+    for(const int ScalarCount : {24, 48, 97, 432})
     {
-        full_inverse[row + row * ScalarCount] = 1.5 + 0.01 * row;
-        for(int col = 0; col < row; ++col)
+        DYNAMIC_SECTION("scalar count " << ScalarCount)
         {
-            const Float coupling = ((row + col) & 1) == 0 ? 0.002 : -0.002;
-            full_inverse[row + col * ScalarCount] = coupling;
-            full_inverse[col + row * ScalarCount] = coupling;
+
+            std::vector<Float> full_inverse(ScalarCount * ScalarCount, 0.0);
+            for(int row = 0; row < ScalarCount; ++row)
+            {
+                full_inverse[row + row * ScalarCount] = 1.5 + 0.01 * row;
+                for(int col = 0; col < row; ++col)
+                {
+                    const Float coupling = ((row + col) & 1) == 0 ? 0.002 : -0.002;
+                    full_inverse[row + col * ScalarCount] = coupling;
+                    full_inverse[col + row * ScalarCount] = coupling;
+                }
+            }
+
+            std::vector<Float> host_x(ScalarCount);
+            std::vector<Float> host_p(ScalarCount);
+            std::vector<Float> host_r(ScalarCount);
+            std::vector<Float> host_Ap(ScalarCount);
+            for(int i = 0; i < ScalarCount; ++i)
+            {
+                host_x[i]  = 0.01 * (i + 1);
+                host_p[i]  = 0.02 * (1 + i % 7);
+                host_r[i]  = 0.15 + 0.003 * i;
+                host_Ap[i] = 0.04 + 0.002 * (i % 5);
+            }
+
+            constexpr Float    RzOld = 4.0;
+            constexpr Float    PAp   = 8.0;
+            constexpr Float    Alpha = RzOld / PAp;
+            std::vector<Float> expected_x(ScalarCount);
+            std::vector<Float> expected_r(ScalarCount);
+            std::vector<Float> expected_z(ScalarCount, 0.0);
+            for(int i = 0; i < ScalarCount; ++i)
+            {
+                expected_x[i] = host_x[i] + Alpha * host_p[i];
+                expected_r[i] = host_r[i] - Alpha * host_Ap[i];
+            }
+            for(int row = 0; row < ScalarCount; ++row)
+                for(int col = 0; col < ScalarCount; ++col)
+                    expected_z[row] +=
+                        full_inverse[row + col * ScalarCount] * expected_r[col];
+            const Float expected_rz = std::inner_product(
+                expected_r.begin(), expected_r.end(), expected_z.begin(), Float{0.0});
+
+            std::vector<FullAbdApplyPolicy> policies;
+            if(ScalarCount < 48)
+                policies.push_back(FullAbdApplyPolicy::SingleLane);
+            else
+            {
+                policies.push_back(FullAbdApplyPolicy::Cooperative16);
+                policies.push_back(FullAbdApplyPolicy::Cooperative32);
+            }
+
+            for(const auto apply_policy : policies)
+            {
+                DYNAMIC_SECTION("policy " << static_cast<int>(apply_policy))
+                {
+                    muda::DeviceBuffer<Float> full_inverse_device{ScalarCount * ScalarCount};
+                    full_inverse_device.view().copy_from(full_inverse.data());
+                    DeviceVector           x{ScalarCount};
+                    DeviceVector           p{ScalarCount};
+                    DeviceVector           r{ScalarCount};
+                    DeviceVector           Ap{ScalarCount};
+                    DeviceVector           z{ScalarCount};
+                    muda::DeviceVar<Float> rz_old{RzOld};
+                    muda::DeviceVar<Float> pAp{PAp};
+                    muda::DeviceVar<Float> rz_new{0.0};
+                    muda::DeviceVar<IndexT> status{static_cast<IndexT>(FusedPcgStatus::Running)};
+                    muda::DeviceVar<FusedPcgDeviceParams> params;
+
+                    x = Eigen::Map<const Eigen::VectorXd>(host_x.data(), host_x.size());
+                    p = Eigen::Map<const Eigen::VectorXd>(host_p.data(), host_p.size());
+                    r = Eigen::Map<const Eigen::VectorXd>(host_r.data(), host_r.size());
+                    Ap = Eigen::Map<const Eigen::VectorXd>(host_Ap.data(),
+                                                           host_Ap.size());
+                    z.fill(0.0);
+                    FusedPcgDeviceParams host_params;
+                    host_params.tolerance         = -1.0;
+                    host_params.active_iterations = 1;
+                    params                        = host_params;
+                    checkCudaErrors(cudaDeviceSynchronize());
+
+                    cudaStream_t stream = nullptr;
+                    checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+                    GraphOwner graph;
+                    checkCudaErrors(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                    launch_fused_pcg_full_abd_update_apply_dot(
+                        full_inverse_device.view(),
+                        x.view(),
+                        p.cview(),
+                        r.view(),
+                        Ap.cview(),
+                        z.view(),
+                        rz_old.view(),
+                        pAp.view(),
+                        rz_new.view(),
+                        status.view(),
+                        params.view(),
+                        apply_policy,
+                        1,
+                        stream);
+                    checkCudaErrors(cudaStreamEndCapture(stream, &graph.graph));
+                    checkCudaErrors(cudaGraphInstantiate(
+                        &graph.exec, graph.graph, nullptr, nullptr, 0));
+                    checkCudaErrors(cudaGraphLaunch(graph.exec, stream));
+                    checkCudaErrors(cudaStreamSynchronize(stream));
+
+                    require_near(copy_vector(x), expected_x, 1e-12, 1e-12);
+                    require_near(copy_vector(r), expected_r, 1e-12, 1e-12);
+                    require_near(copy_vector(z), expected_z, 1e-11, 1e-11);
+                    REQUIRE(copy_var(rz_new) == Catch::Approx(expected_rz).margin(1e-10));
+                    REQUIRE(copy_var(status) == static_cast<IndexT>(FusedPcgStatus::Running));
+
+                    checkCudaErrors(cudaStreamDestroy(stream));
+                }
+            }
         }
     }
+}
 
+TEST_CASE("full_abd_policy_threshold_uses_device_fp64_capability",
+          "[cuda][fused_pcg][graph][preconditioner][full_abd_graph]")
+{
+    REQUIRE(select_full_abd_apply_policy(47) == FullAbdApplyPolicy::SingleLane);
+
+    int device                           = 0;
+    int single_to_double_precision_ratio = 0;
+    checkCudaErrors(cudaGetDevice(&device));
+    checkCudaErrors(cudaDeviceGetAttribute(&single_to_double_precision_ratio,
+                                           cudaDevAttrSingleToDoublePrecisionPerfRatio,
+                                           device));
+    const auto expected = single_to_double_precision_ratio <= 4 ?
+                              FullAbdApplyPolicy::Cooperative32 :
+                              FullAbdApplyPolicy::Cooperative16;
+    REQUIRE(select_full_abd_apply_policy(48) == expected);
+}
+
+TEST_CASE("full_abd_cooperative_tail_is_safe_for_inactive_graph_nodes",
+          "[cuda][fused_pcg][graph][preconditioner][full_abd_graph]")
+{
+    constexpr int      ScalarCount = 97;
+    std::vector<Float> full_inverse(ScalarCount * ScalarCount, 0.0);
     std::vector<Float> host_x(ScalarCount);
     std::vector<Float> host_p(ScalarCount);
     std::vector<Float> host_r(ScalarCount);
     std::vector<Float> host_Ap(ScalarCount);
+    std::vector<Float> host_z(ScalarCount, 7.0);
     for(int i = 0; i < ScalarCount; ++i)
     {
-        host_x[i]  = 0.01 * (i + 1);
-        host_p[i]  = 0.02 * (1 + i % 7);
-        host_r[i]  = 0.15 + 0.003 * i;
-        host_Ap[i] = 0.04 + 0.002 * (i % 5);
+        full_inverse[i + i * ScalarCount] = 1.0;
+        host_x[i]                         = 0.01 * i;
+        host_p[i]                         = 0.02 * (i + 1);
+        host_r[i]                         = 0.03 * (i + 1);
+        host_Ap[i]                        = 0.04 * (i + 1);
     }
 
-    constexpr Float    RzOld = 4.0;
-    constexpr Float    PAp   = 8.0;
-    constexpr Float    Alpha = RzOld / PAp;
-    std::vector<Float> expected_x(ScalarCount);
-    std::vector<Float> expected_r(ScalarCount);
-    std::vector<Float> expected_z(ScalarCount, 0.0);
-    for(int i = 0; i < ScalarCount; ++i)
+    for(const auto policy :
+        {FullAbdApplyPolicy::Cooperative16, FullAbdApplyPolicy::Cooperative32})
     {
-        expected_x[i] = host_x[i] + Alpha * host_p[i];
-        expected_r[i] = host_r[i] - Alpha * host_Ap[i];
+        for(const auto initial_status : {FusedPcgStatus::Running, FusedPcgStatus::Converged})
+        {
+            DYNAMIC_SECTION("policy " << static_cast<int>(policy) << ", status "
+                                      << static_cast<int>(initial_status))
+            {
+                muda::DeviceBuffer<Float> full_inverse_device{ScalarCount * ScalarCount};
+                full_inverse_device.view().copy_from(full_inverse.data());
+                DeviceVector           x{ScalarCount};
+                DeviceVector           p{ScalarCount};
+                DeviceVector           r{ScalarCount};
+                DeviceVector           Ap{ScalarCount};
+                DeviceVector           z{ScalarCount};
+                muda::DeviceVar<Float> rz_old{4.0};
+                muda::DeviceVar<Float> pAp{8.0};
+                muda::DeviceVar<Float> rz_new{0.0};
+                muda::DeviceVar<IndexT> status{static_cast<IndexT>(initial_status)};
+                muda::DeviceVar<FusedPcgDeviceParams> params;
+
+                x = Eigen::Map<const Eigen::VectorXd>(host_x.data(), host_x.size());
+                p = Eigen::Map<const Eigen::VectorXd>(host_p.data(), host_p.size());
+                r = Eigen::Map<const Eigen::VectorXd>(host_r.data(), host_r.size());
+                Ap = Eigen::Map<const Eigen::VectorXd>(host_Ap.data(), host_Ap.size());
+                z = Eigen::Map<const Eigen::VectorXd>(host_z.data(), host_z.size());
+                FusedPcgDeviceParams host_params;
+                host_params.tolerance = -1.0;
+                host_params.active_iterations =
+                    initial_status == FusedPcgStatus::Running ? 0 : 1;
+                params = host_params;
+                checkCudaErrors(cudaDeviceSynchronize());
+
+                cudaStream_t stream = nullptr;
+                checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+                GraphOwner graph;
+                checkCudaErrors(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                launch_fused_pcg_full_abd_update_apply_dot(full_inverse_device.view(),
+                                                           x.view(),
+                                                           p.cview(),
+                                                           r.view(),
+                                                           Ap.cview(),
+                                                           z.view(),
+                                                           rz_old.view(),
+                                                           pAp.view(),
+                                                           rz_new.view(),
+                                                           status.view(),
+                                                           params.view(),
+                                                           policy,
+                                                           1,
+                                                           stream);
+                checkCudaErrors(cudaStreamEndCapture(stream, &graph.graph));
+                checkCudaErrors(
+                    cudaGraphInstantiate(&graph.exec, graph.graph, nullptr, nullptr, 0));
+                checkCudaErrors(cudaGraphLaunch(graph.exec, stream));
+                checkCudaErrors(cudaStreamSynchronize(stream));
+
+                require_near(copy_vector(x), host_x, 0.0, 0.0);
+                require_near(copy_vector(r), host_r, 0.0, 0.0);
+                require_near(copy_vector(z), host_z, 0.0, 0.0);
+                REQUIRE(copy_var(rz_new) == 0.0);
+                REQUIRE(copy_var(status) == static_cast<IndexT>(initial_status));
+
+                checkCudaErrors(cudaStreamDestroy(stream));
+            }
+        }
     }
-    for(int row = 0; row < ScalarCount; ++row)
-        for(int col = 0; col < ScalarCount; ++col)
-            expected_z[row] += full_inverse[row + col * ScalarCount] * expected_r[col];
-    const Float expected_rz = std::inner_product(
-        expected_r.begin(), expected_r.end(), expected_z.begin(), Float{0.0});
-
-    muda::DeviceBuffer<Float> full_inverse_device{ScalarCount * ScalarCount};
-    full_inverse_device.view().copy_from(full_inverse.data());
-    DeviceVector           x{ScalarCount};
-    DeviceVector           p{ScalarCount};
-    DeviceVector           r{ScalarCount};
-    DeviceVector           Ap{ScalarCount};
-    DeviceVector           z{ScalarCount};
-    muda::DeviceVar<Float> rz_old{RzOld};
-    muda::DeviceVar<Float> pAp{PAp};
-    muda::DeviceVar<Float> rz_new{0.0};
-    muda::DeviceVar<IndexT> status{static_cast<IndexT>(FusedPcgStatus::Running)};
-    muda::DeviceVar<FusedPcgDeviceParams> params;
-
-    x  = Eigen::Map<const Eigen::VectorXd>(host_x.data(), host_x.size());
-    p  = Eigen::Map<const Eigen::VectorXd>(host_p.data(), host_p.size());
-    r  = Eigen::Map<const Eigen::VectorXd>(host_r.data(), host_r.size());
-    Ap = Eigen::Map<const Eigen::VectorXd>(host_Ap.data(), host_Ap.size());
-    z.fill(0.0);
-    FusedPcgDeviceParams host_params;
-    host_params.tolerance         = -1.0;
-    host_params.active_iterations = 1;
-    params                        = host_params;
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    cudaStream_t stream = nullptr;
-    checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    GraphOwner graph;
-    checkCudaErrors(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    launch_fused_pcg_full_abd_update_apply_dot(full_inverse_device.view(),
-                                               x.view(),
-                                               p.cview(),
-                                               r.view(),
-                                               Ap.cview(),
-                                               z.view(),
-                                               rz_old.view(),
-                                               pAp.view(),
-                                               rz_new.view(),
-                                               status.view(),
-                                               params.view(),
-                                               1,
-                                               stream);
-    checkCudaErrors(cudaStreamEndCapture(stream, &graph.graph));
-    checkCudaErrors(cudaGraphInstantiate(&graph.exec, graph.graph, nullptr, nullptr, 0));
-    checkCudaErrors(cudaGraphLaunch(graph.exec, stream));
-    checkCudaErrors(cudaStreamSynchronize(stream));
-
-    require_near(copy_vector(x), expected_x, 1e-12, 1e-12);
-    require_near(copy_vector(r), expected_r, 1e-12, 1e-12);
-    require_near(copy_vector(z), expected_z, 1e-11, 1e-11);
-    REQUIRE(copy_var(rz_new) == Catch::Approx(expected_rz).margin(1e-10));
-    REQUIRE(copy_var(status) == static_cast<IndexT>(FusedPcgStatus::Running));
-
-    checkCudaErrors(cudaStreamDestroy(stream));
 }
 
 TEST_CASE("five_kernel_alpha_matches_legacy_division_semantics",

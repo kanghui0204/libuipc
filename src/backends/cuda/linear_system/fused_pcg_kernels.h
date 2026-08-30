@@ -7,6 +7,15 @@
 
 namespace uipc::backend::cuda
 {
+enum class FullAbdApplyPolicy
+{
+    SingleLane,
+    Cooperative16,
+    Cooperative32
+};
+
+FullAbdApplyPolicy select_full_abd_apply_policy(SizeT vector_size);
+
 void launch_fused_pcg_update_convergence(muda::CVarView<Float> rz_old,
                                          muda::CVarView<Float> rz_new,
                                          muda::VarView<Float>  beta,
@@ -26,6 +35,20 @@ void launch_fused_pcg_update_p_prepare_next(muda::DenseVectorView<Float>  p,
                                             muda::CVarView<FusedPcgDeviceParams> params,
                                             IndexT       iteration_in_chunk,
                                             cudaStream_t stream);
+
+void launch_fused_pcg_convergence_update_p_prepare_next(
+    muda::DenseVectorView<Float>         p,
+    muda::CDenseVectorView<Float>        z,
+    muda::CVarView<Float>                rz_old,
+    muda::CVarView<Float>                rz_new,
+    muda::VarView<Float>                 beta,
+    muda::VarView<Float>                 rz_old_next,
+    muda::VarView<Float>                 rz_new_next,
+    muda::VarView<IndexT>                status,
+    muda::VarView<FusedPcgCheckState>    check_state,
+    muda::CVarView<FusedPcgDeviceParams> params,
+    IndexT                               iteration_in_chunk,
+    cudaStream_t                         stream);
 
 void launch_fused_pcg_identity_update_apply_dot(muda::DenseVectorView<Float>  x,
                                                 muda::CDenseVectorView<Float> p,
@@ -71,6 +94,7 @@ void launch_fused_pcg_full_abd_update_apply_dot(muda::CBufferView<Float> full_in
                                                 muda::VarView<Float>   rz_new,
                                                 muda::CVarView<IndexT> status,
                                                 muda::CVarView<FusedPcgDeviceParams> params,
+                                                FullAbdApplyPolicy policy,
                                                 IndexT       iteration_in_chunk,
                                                 cudaStream_t stream);
 
