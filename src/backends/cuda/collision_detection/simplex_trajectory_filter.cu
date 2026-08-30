@@ -91,7 +91,7 @@ void SimplexTrajectoryFilter::Impl::label_active_vertices(GlobalTrajectoryFilter
 
 void SimplexTrajectoryFilter::do_filter_active(GlobalTrajectoryFilter::FilterActiveInfo& info)
 {
-    FilterActiveInfo this_info{&m_impl};
+    FilterActiveInfo this_info{&m_impl, info.batch_active_counts()};
     do_filter_active(this_info);
 
     logger::info("SimplexTrajectoryFilter PTs: {}, EEs: {}, PEs: {}, PPs: {}",

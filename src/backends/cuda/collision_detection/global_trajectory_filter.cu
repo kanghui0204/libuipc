@@ -60,7 +60,7 @@ void GlobalTrajectoryFilter::detect(Float alpha)
     }
 }
 
-void GlobalTrajectoryFilter::filter_active()
+void GlobalTrajectoryFilter::filter_active(bool batch_active_counts)
 {
     if(m_impl.global_contact_manager->cfl_enabled())
     {
@@ -71,7 +71,7 @@ void GlobalTrajectoryFilter::filter_active()
 
     for(auto filter : m_impl.filters.view())
     {
-        FilterActiveInfo info(&m_impl);
+        FilterActiveInfo info(&m_impl, batch_active_counts);
         filter->filter_active(info);
     }
 }

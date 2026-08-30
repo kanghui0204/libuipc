@@ -4,6 +4,7 @@
 #include <global_geometry/global_simplicial_surface_manager.h>
 #include <contact_system/global_contact_manager.h>
 #include <collision_detection/info_stackless_bvh.h>
+#include <collision_detection/active_contact_count_readback.h>
 #include <collision_detection/simplex_trajectory_filter.h>
 
 namespace uipc::backend::cuda
@@ -56,6 +57,7 @@ class InfoStacklessBVHSimplexTrajectoryFilter final : public SimplexTrajectoryFi
         muda::DeviceVar<IndexT> selected_EE_count;
         muda::DeviceVar<IndexT> selected_PE_count;
         muda::DeviceVar<IndexT> selected_PP_count;
+        ActiveContactCountReadback batched_active_count_readback;
 
         muda::DeviceBuffer<Vector4i> temp_PTs;
         muda::DeviceBuffer<Vector4i> temp_EEs;

@@ -50,7 +50,7 @@ void SimEngine::advance()
         if(m_global_trajectory_filter)
         {
             Timer timer{"Filter Contact Candidates"};
-            m_global_trajectory_filter->filter_active();
+            m_global_trajectory_filter->filter_active(true);
         }
     };
 
