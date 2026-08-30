@@ -1184,18 +1184,21 @@ TEST_CASE("fused_pcg_f03_convergence_prepare_fusion_matches_two_node_oracle",
         }
     }
 
-    SECTION("multi-block running publication survives repeated graph launches")
+    SECTION("4096-CTA running publication survives repeated graph launches")
     {
-        constexpr SizeT ActualFullAbdDofCount = 420;
-        constexpr SizeT RepeatCount           = 257;
+        // The fused kernel uses 64 threads per CTA. 4096 CTAs force many
+        // scheduling waves on the test GPU while keeping memory and runtime
+        // bounded enough for sanitizer runs.
+        constexpr SizeT StressVectorSize = SizeT{4096} * SizeT{64};
+        constexpr SizeT RepeatCount      = 17;
         const auto legacy = run(false,
-                                ActualFullAbdDofCount,
+                                StressVectorSize,
                                 0.5,
                                 10,
                                 RepeatCount,
                                 true);
         const auto fused = run(true,
-                               ActualFullAbdDofCount,
+                               StressVectorSize,
                                0.5,
                                10,
                                RepeatCount,
@@ -1203,6 +1206,32 @@ TEST_CASE("fused_pcg_f03_convergence_prepare_fusion_matches_two_node_oracle",
         require_exact(fused, legacy);
         REQUIRE(fused.graph_nodes == 1);
         REQUIRE(legacy.graph_nodes == 2);
+    }
+
+    SECTION("4096-CTA converged publication matches the two-node oracle")
+    {
+        constexpr SizeT StressVectorSize = SizeT{4096} * SizeT{64};
+        const auto legacy = run(false, StressVectorSize, 1.0, 10);
+        const auto fused  = run(true, StressVectorSize, 1.0, 10);
+        require_exact(fused, legacy);
+    }
+
+    SECTION("4096-CTA inactive launch matches the two-node oracle")
+    {
+        constexpr SizeT StressVectorSize = SizeT{4096} * SizeT{64};
+        const auto legacy = run(false, StressVectorSize, 0.5, 0);
+        const auto fused  = run(true, StressVectorSize, 0.5, 0);
+        require_exact(fused, legacy);
+    }
+
+    SECTION("zero-length repeated graph launch matches the two-node oracle")
+    {
+        constexpr SizeT RepeatCount = 17;
+        const auto legacy = run(false, SizeT{0}, 0.5, 10, RepeatCount, true);
+        const auto fused  = run(true, SizeT{0}, 0.5, 10, RepeatCount, true);
+        require_exact(fused, legacy);
+        REQUIRE(fused.graph_nodes == 1);
+        REQUIRE(legacy.graph_nodes == 1);
     }
 }
 

@@ -161,6 +161,10 @@ namespace
 
                 if(observed < 0 && observed != PcgPrepareClaimed)
                 {
+                    // Pair with the publisher's release fence before reading
+                    // beta and the other scalar state published with the
+                    // negative countdown.
+                    __threadfence();
                     block_beta    = *beta;
                     block_running = 1;
                 }
