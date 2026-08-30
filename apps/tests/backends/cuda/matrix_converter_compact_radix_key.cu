@@ -1,0 +1,120 @@
+#include <app/app.h>
+#include <algorithm/matrix_converter.h>
+#include <muda/buffer/device_buffer.h>
+#include <muda/cub/device/device_radix_sort.h>
+
+#include <array>
+#include <limits>
+#include <vector>
+
+using namespace muda;
+using namespace uipc::backend::cuda;
+
+TEST_CASE("matrix converter compact radix key preserves lexicographic order",
+          "[matrix_converter][compact_radix_key]")
+{
+    constexpr int Rows = 8192;
+    constexpr int Cols = 4097;
+
+    constexpr auto config = matrix_converter_radix_key_config(Rows, Cols);
+    STATIC_REQUIRE(config.col_bits == 13);
+    STATIC_REQUIRE(config.end_bit == 26);
+    STATIC_REQUIRE(config.compact);
+
+    constexpr auto empty_config = matrix_converter_radix_key_config(0, Cols);
+    STATIC_REQUIRE_FALSE(empty_config.compact);
+    STATIC_REQUIRE(empty_config.end_bit == 64);
+
+    constexpr auto max_config = matrix_converter_radix_key_config(
+        std::numeric_limits<int>::max(), std::numeric_limits<int>::max());
+    STATIC_REQUIRE(max_config.compact);
+    STATIC_REQUIRE(max_config.end_bit == 62);
+    constexpr auto max_key = matrix_converter_pack_radix_key(
+        std::numeric_limits<int>::max() - 1,
+        std::numeric_limits<int>::max() - 1,
+        max_config);
+    constexpr auto max_ij = matrix_converter_unpack_radix_key(max_key, max_config);
+    STATIC_REQUIRE(max_ij.x == std::numeric_limits<int>::max() - 1);
+    STATIC_REQUIRE(max_ij.y == std::numeric_limits<int>::max() - 1);
+
+    const std::array<int, 8> rows = {8191, 0, 17, 17, 4096, 0, 17, 8191};
+    const std::array<int, 8> cols = {4096, 1, 2, 2, 0, 0, 4096, 0};
+    const std::array<float, 8> values = {1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 128.0f};
+
+    DeviceTripletMatrix<float, 1> from;
+    DeviceBCOOMatrix<float, 1>    to;
+    MatrixConverter<float, 1>     converter;
+
+    from.resize(Rows, Cols, rows.size());
+    from.row_indices().copy_from(rows.data());
+    from.col_indices().copy_from(cols.data());
+    from.values().copy_from(values.data());
+
+    converter.convert(from, to);
+
+    std::vector<int>   actual_rows(to.triplet_count());
+    std::vector<int>   actual_cols(to.triplet_count());
+    std::vector<float> actual_values(to.triplet_count());
+    to.row_indices().copy_to(actual_rows.data());
+    to.col_indices().copy_to(actual_cols.data());
+    to.values().copy_to(actual_values.data());
+
+    const std::vector<int> expected_rows = {0, 0, 17, 17, 4096, 8191, 8191};
+    const std::vector<int> expected_cols = {0, 1, 2, 4096, 0, 0, 4096};
+    const std::vector<float> expected_values = {32.0f, 2.0f, 12.0f, 64.0f, 16.0f, 128.0f, 1.0f};
+
+    REQUIRE(actual_rows == expected_rows);
+    REQUIRE(actual_cols == expected_cols);
+    REQUIRE(actual_values == expected_values);
+
+    for(size_t i = 0; i < rows.size(); ++i)
+    {
+        const auto key = matrix_converter_pack_radix_key(rows[i], cols[i], config);
+        const auto ij  = matrix_converter_unpack_radix_key(key, config);
+        REQUIRE(ij.x == rows[i]);
+        REQUIRE(ij.y == cols[i]);
+    }
+}
+
+TEST_CASE("compact radix sort remains stable for duplicate matrix keys",
+          "[matrix_converter][compact_radix_key]")
+{
+    constexpr auto config = matrix_converter_radix_key_config(32, 17);
+    const std::array<MatrixConverterIntPair, 8> ij = {
+        MatrixConverterIntPair{3, 4},
+        MatrixConverterIntPair{1, 2},
+        MatrixConverterIntPair{3, 4},
+        MatrixConverterIntPair{0, 16},
+        MatrixConverterIntPair{1, 2},
+        MatrixConverterIntPair{31, 0},
+        MatrixConverterIntPair{3, 4},
+        MatrixConverterIntPair{0, 0}};
+
+    std::array<uint64_t, ij.size()> keys{};
+    std::array<int, ij.size()>      order{};
+    for(size_t i = 0; i < ij.size(); ++i)
+    {
+        keys[i]  = matrix_converter_pack_radix_key(ij[i].x, ij[i].y, config);
+        order[i] = static_cast<int>(i);
+    }
+
+    DeviceBuffer<uint64_t> keys_in(keys.size());
+    DeviceBuffer<uint64_t> keys_out(keys.size());
+    DeviceBuffer<int>      order_in(order.size());
+    DeviceBuffer<int>      order_out(order.size());
+    keys_in.view().copy_from(keys.data());
+    order_in.view().copy_from(order.data());
+
+    DeviceRadixSort().SortPairs(keys_in.data(),
+                                keys_out.data(),
+                                order_in.data(),
+                                order_out.data(),
+                                keys.size(),
+                                0,
+                                config.end_bit);
+
+    std::array<int, order.size()> actual{};
+    order_out.view().copy_to(actual.data());
+    const std::array<int, order.size()> expected = {7, 3, 1, 4, 0, 2, 6, 5};
+    REQUIRE(actual == expected);
+}

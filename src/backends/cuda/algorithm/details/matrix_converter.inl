@@ -45,6 +45,8 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(
     loose_resize(sort_index, src_row_indices.size());
     ij_pairs.resize(src_row_indices.size());
 
+    const auto radix_key_config = matrix_converter_radix_key_config(from.rows(), from.cols());
+
 
     // hash ij
     ParallelFor(256)
@@ -53,10 +55,11 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(
                [row_indices = src_row_indices.cviewer().name("row_indices"),
                 col_indices = src_col_indices.cviewer().name("col_indices"),
                 ij_hash     = ij_hash_input.viewer().name("ij_hash"),
-                sort_index = sort_index_input.viewer().name("sort_index")] __device__(int i) mutable
+                sort_index = sort_index_input.viewer().name("sort_index"),
+                radix_key_config] __device__(int i) mutable
                {
-                   ij_hash(i) = (static_cast<uint64_t>(row_indices(i)) << 32)
-                                + static_cast<uint64_t>(col_indices(i));
+                   ij_hash(i) = matrix_converter_pack_radix_key(
+                       row_indices(i), col_indices(i), radix_key_config);
                    sort_index(i) = i;
                });
 
@@ -64,7 +67,9 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(
                                 ij_hash.data(),
                                 sort_index_input.data(),
                                 sort_index.data(),
-                                ij_hash.size());
+                                ij_hash.size(),
+                                0,
+                                radix_key_config.end_bit);
 
     // set ij_hash back to row_indices and col_indices
 
@@ -75,13 +80,11 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(
         .file_line(__FILE__, __LINE__)
         .apply(dst_row_indices.size(),
                [ij_hash = ij_hash.viewer().name("ij_hash"),
-                ij_pairs = ij_pairs.viewer().name("ij_pairs")] __device__(int i) mutable
+                ij_pairs = ij_pairs.viewer().name("ij_pairs"),
+                radix_key_config] __device__(int i) mutable
                {
-                   auto hash      = ij_hash(i);
-                   auto row_index = static_cast<int>(hash >> 32);
-                   auto col_index = static_cast<int>(hash & 0xFFFFFFFF);
-                   ij_pairs(i).x  = row_index;
-                   ij_pairs(i).y  = col_index;
+                   ij_pairs(i) = matrix_converter_unpack_radix_key(ij_hash(i),
+                                                                   radix_key_config);
                });
 
     // sort the block values
@@ -114,6 +117,8 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(muda::DeviceBCOOMatri
     loose_resize(sort_index, src_row_indices.size());
     ij_pairs.resize(src_row_indices.size());
 
+    const auto radix_key_config = matrix_converter_radix_key_config(to.rows(), to.cols());
+
 
     // hash ij
     ParallelFor(256)
@@ -122,10 +127,11 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(muda::DeviceBCOOMatri
                [row_indices = src_row_indices.cviewer().name("row_indices"),
                 col_indices = src_col_indices.cviewer().name("col_indices"),
                 ij_hash     = ij_hash_input.viewer().name("ij_hash"),
-                sort_index = sort_index_input.viewer().name("sort_index")] __device__(int i) mutable
+                sort_index = sort_index_input.viewer().name("sort_index"),
+                radix_key_config] __device__(int i) mutable
                {
-                   ij_hash(i) =
-                       (uint64_t{row_indices(i)} << 32) + uint64_t{col_indices(i)};
+                   ij_hash(i) = matrix_converter_pack_radix_key(
+                       row_indices(i), col_indices(i), radix_key_config);
                    sort_index(i) = i;
                });
 
@@ -133,7 +139,9 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(muda::DeviceBCOOMatri
                                 ij_hash.data(),
                                 sort_index_input.data(),
                                 sort_index.data(),
-                                ij_hash.size());
+                                ij_hash.size(),
+                                0,
+                                radix_key_config.end_bit);
 
     // set ij_hash back to row_indices and col_indices
 
@@ -144,13 +152,11 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(muda::DeviceBCOOMatri
         .file_line(__FILE__, __LINE__)
         .apply(dst_row_indices.size(),
                [ij_hash = ij_hash.viewer().name("ij_hash"),
-                ij_pairs = ij_pairs.viewer().name("ij_pairs")] __device__(int i) mutable
+                ij_pairs = ij_pairs.viewer().name("ij_pairs"),
+                radix_key_config] __device__(int i) mutable
                {
-                   auto hash      = ij_hash(i);
-                   auto row_index = int{hash >> 32};
-                   auto col_index = int{hash & 0xFFFFFFFF};
-                   ij_pairs(i).x  = row_index;
-                   ij_pairs(i).y  = col_index;
+                   ij_pairs(i) = matrix_converter_unpack_radix_key(ij_hash(i),
+                                                                   radix_key_config);
                });
 
     // sort the block values

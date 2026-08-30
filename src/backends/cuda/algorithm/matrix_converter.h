@@ -16,6 +16,51 @@ struct MatrixConverterIntPair
     int y;
 };
 
+struct MatrixConverterRadixKeyConfig
+{
+    int      col_bits;
+    int      end_bit;
+    uint64_t col_mask;
+    bool     compact;
+};
+
+constexpr int matrix_converter_index_bits(int extent)
+{
+    auto value = extent > 1 ? static_cast<uint32_t>(extent - 1) : uint32_t{0};
+    int  bits  = 1;
+    while(value >>= 1)
+        ++bits;
+    return bits;
+}
+
+constexpr MatrixConverterRadixKeyConfig matrix_converter_radix_key_config(int rows,
+                                                                           int cols)
+{
+    if(rows <= 0 || cols <= 0)
+        return {32, 64, 0xFFFFFFFFull, false};
+
+    const int col_bits = matrix_converter_index_bits(cols);
+    const int end_bit  = col_bits + matrix_converter_index_bits(rows);
+    if(col_bits >= 64 || end_bit > 64)
+        return {32, 64, 0xFFFFFFFFull, false};
+
+    return {col_bits, end_bit, (uint64_t{1} << col_bits) - uint64_t{1}, true};
+}
+
+inline UIPC_GENERIC constexpr uint64_t matrix_converter_pack_radix_key(
+    int row, int col, const MatrixConverterRadixKeyConfig& config)
+{
+    return (static_cast<uint64_t>(static_cast<uint32_t>(row)) << config.col_bits)
+           | static_cast<uint64_t>(static_cast<uint32_t>(col));
+}
+
+inline UIPC_GENERIC constexpr MatrixConverterIntPair matrix_converter_unpack_radix_key(
+    uint64_t key, const MatrixConverterRadixKeyConfig& config)
+{
+    return {static_cast<int>(key >> config.col_bits),
+            static_cast<int>(key & config.col_mask)};
+}
+
 constexpr bool operator==(const MatrixConverterIntPair& l, const MatrixConverterIntPair& r)
 {
     return l.x == r.x && l.y == r.y;
