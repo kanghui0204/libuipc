@@ -1014,8 +1014,16 @@ inline InfoStacklessBVH::InfoStacklessBVH(muda::Stream& stream) noexcept
     (void)stream;
 }
 
-inline void InfoStacklessBVH::QueryBuffer::build(muda::CBufferView<AABB> aabbs)
+inline void InfoStacklessBVH::QueryBuffer::build(muda::CBufferView<AABB> aabbs,
+                                                 bool reuse_order)
 {
+    // Morton order is only a traversal scheduling choice. It is not part of
+    // the pair predicate. During Line Search the query primitive identities
+    // and count are unchanged, so the order prepared by the preceding DCD
+    // pass remains a valid permutation even when the swept boxes move.
+    if(reuse_order && m_querySortedId.size() == aabbs.size())
+        return;
+
     m_queryMtCode.resize(aabbs.size());
     m_querySortedId.resize(aabbs.size());
     Impl::calcMaxBVFromBox(aabbs, m_querySceneBox);
@@ -1118,7 +1126,8 @@ inline void InfoStacklessBVH::query(muda::CBufferView<AABB>     query_aabbs,
                                     muda::CBuffer2DView<IndexT> cmts,
                                     NodePred                    np,
                                     LeafPred                    lp,
-                                    QueryBuffer&                qbuffer)
+                                    QueryBuffer&                qbuffer,
+                                    bool                        reuse_query_order)
 {
     if(m_aabbs.size() == 0 || query_aabbs.size() == 0)
     {
@@ -1135,7 +1144,7 @@ inline void InfoStacklessBVH::query(muda::CBufferView<AABB>     query_aabbs,
                 query_CIDs.size());
 
     using namespace muda;
-    qbuffer.build(query_aabbs);
+    qbuffer.build(query_aabbs, reuse_query_order);
     auto do_query = [&]
     {
         BufferLaunch().fill(qbuffer.m_cpNum.view(), 0);
