@@ -1,4 +1,4 @@
-#include <linear_system/fused_pcg_kernels.h>
+#include "fused_pcg_kernels.h"
 
 #include <cub/block/block_reduce.cuh>
 #include <cmath>
@@ -8,7 +8,10 @@ namespace uipc::backend::cuda
 {
 namespace
 {
-    constexpr int PcgVectorBlockSize = 64;
+    constexpr int PcgVectorBlockSize         = 64;
+    constexpr int FullAbdSingleLaneBlockSize = 16;
+    constexpr int FullAbdCooperativeMinSize  = 48;
+    constexpr int StrongFp64MaxRatio         = 4;
 
     __device__ bool iteration_is_active(const FusedPcgDeviceParams* params, IndexT iteration_in_chunk)
     {
@@ -77,6 +80,55 @@ namespace
         {
             *rz_old_next = *rz_new;
             *rz_new_next = Float{0.0};
+        }
+    }
+
+    __global__ void convergence_update_p_prepare_next_kernel(
+        Float* __restrict__ p,
+        const Float* __restrict__ z,
+        SizeT vector_size,
+        const Float* __restrict__ rz_old,
+        const Float* __restrict__ rz_new,
+        Float* __restrict__ beta,
+        Float* __restrict__ rz_old_next,
+        Float* __restrict__ rz_new_next,
+        IndexT* __restrict__ status,
+        FusedPcgCheckState* __restrict__ check_state,
+        const FusedPcgDeviceParams* __restrict__ params,
+        IndexT iteration_in_chunk)
+    {
+        if(!iteration_is_active(params, iteration_in_chunk))
+            return;
+
+        const IndexT observed_status = atomicAdd(status, IndexT{0});
+        if(observed_status != static_cast<IndexT>(FusedPcgStatus::Running))
+            return;
+
+        const Float old_value  = *rz_old;
+        const Float new_value  = *rz_new;
+        const bool  converged  = fabs(new_value) <= params->tolerance;
+        const Float beta_value = new_value / old_value;
+
+        const SizeT i = static_cast<SizeT>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if(!converged && i < vector_size)
+            p[i] = z[i] + beta_value * p[i];
+
+        if(blockIdx.x == 0 && threadIdx.x == 0)
+        {
+            if(converged)
+                atomicExch(status, static_cast<IndexT>(FusedPcgStatus::Converged));
+            else
+            {
+                *beta        = beta_value;
+                *rz_old_next = new_value;
+                *rz_new_next = Float{0.0};
+            }
+
+            check_state->rz = new_value;
+            check_state->status =
+                converged ? static_cast<IndexT>(FusedPcgStatus::Converged) :
+                            static_cast<IndexT>(FusedPcgStatus::Running);
+            check_state->iteration_in_chunk = iteration_in_chunk;
         }
     }
 
@@ -188,16 +240,17 @@ namespace
         r[i] -= alpha * Ap[i];
     }
 
-    __global__ void full_abd_apply_dot_kernel(const Float* __restrict__ full_inv,
-                                              SizeT vector_size,
-                                              const Float* __restrict__ r,
-                                              Float* __restrict__ z,
-                                              Float* __restrict__ rz_new,
-                                              const IndexT* __restrict__ status,
-                                              const FusedPcgDeviceParams* __restrict__ params,
-                                              IndexT iteration_in_chunk)
+    __global__ void full_abd_apply_dot_single_lane_kernel(
+        const Float* __restrict__ full_inv,
+        SizeT vector_size,
+        const Float* __restrict__ r,
+        Float* __restrict__ z,
+        Float* __restrict__ rz_new,
+        const IndexT* __restrict__ status,
+        const FusedPcgDeviceParams* __restrict__ params,
+        IndexT iteration_in_chunk)
     {
-        using BlockReduce = cub::BlockReduce<Float, PcgVectorBlockSize>;
+        using BlockReduce = cub::BlockReduce<Float, FullAbdSingleLaneBlockSize>;
         __shared__ typename BlockReduce::TempStorage reduce_storage;
 
         const SizeT row =
@@ -217,6 +270,66 @@ namespace
         const Float block_sum = BlockReduce(reduce_storage).Sum(local_dot);
         if(threadIdx.x == 0 && block_sum != Float{0.0})
             atomicAdd(rz_new, block_sum);
+    }
+
+    template <int WorkersPerRow, int WarpsPerBlock>
+    __global__ void full_abd_apply_dot_kernel(const Float* __restrict__ full_inv,
+                                              SizeT vector_size,
+                                              const Float* __restrict__ r,
+                                              Float* __restrict__ z,
+                                              Float* __restrict__ rz_new,
+                                              const IndexT* __restrict__ status,
+                                              const FusedPcgDeviceParams* __restrict__ params,
+                                              IndexT iteration_in_chunk)
+    {
+        constexpr int RowsPerWarp  = 32 / WorkersPerRow;
+        constexpr int RowsPerBlock = RowsPerWarp * WarpsPerBlock;
+        static_assert(WorkersPerRow * RowsPerWarp == 32);
+
+        __shared__ Float warp_dots[WarpsPerBlock];
+        const int        lane        = threadIdx.x & 31;
+        const int        warp        = threadIdx.x >> 5;
+        const int        row_in_warp = lane % RowsPerWarp;
+        const int        worker      = lane / RowsPerWarp;
+        const SizeT      row = static_cast<SizeT>(blockIdx.x) * RowsPerBlock
+                          + warp * RowsPerWarp + row_in_warp;
+        const bool running = iteration_is_active(params, iteration_in_chunk)
+                             && *status == static_cast<IndexT>(FusedPcgStatus::Running);
+
+        Float z_value = 0.0;
+        if(running && row < vector_size)
+        {
+            for(SizeT col = worker; col < vector_size; col += WorkersPerRow)
+                z_value = fma(full_inv[row + col * vector_size], r[col], z_value);
+        }
+
+#pragma unroll
+        for(int offset = 16; offset >= RowsPerWarp; offset >>= 1)
+            z_value += __shfl_down_sync(0xffffffffu, z_value, offset);
+
+        Float local_dot = 0.0;
+        if(worker == 0 && running && row < vector_size)
+        {
+            z[row]    = z_value;
+            local_dot = r[row] * z_value;
+        }
+
+#pragma unroll
+        for(int offset = 16; offset > 0; offset >>= 1)
+            local_dot += __shfl_down_sync(0xffffffffu, local_dot, offset);
+        if(lane == 0)
+            warp_dots[warp] = local_dot;
+        __syncthreads();
+
+        if(threadIdx.x == 0)
+        {
+            Float block_dot = 0.0;
+#pragma unroll
+            for(int i = 0; i < WarpsPerBlock; ++i)
+                block_dot += warp_dots[i];
+            if(block_dot != Float{0.0})
+                atomicAdd(rz_new, block_dot);
+        }
     }
 
     __global__ void fem_fused_update_apply_dot_kernel(const Matrix3x3* __restrict__ diag_inv,
@@ -266,6 +379,23 @@ namespace
     }
 }  // namespace
 
+FullAbdApplyPolicy select_full_abd_apply_policy(SizeT vector_size)
+{
+    if(vector_size < FullAbdCooperativeMinSize)
+        return FullAbdApplyPolicy::SingleLane;
+
+    int device                           = 0;
+    int single_to_double_precision_ratio = 0;
+    checkCudaErrors(cudaGetDevice(&device));
+    checkCudaErrors(cudaDeviceGetAttribute(&single_to_double_precision_ratio,
+                                           cudaDevAttrSingleToDoublePrecisionPerfRatio,
+                                           device));
+
+    return single_to_double_precision_ratio <= StrongFp64MaxRatio ?
+               FullAbdApplyPolicy::Cooperative32 :
+               FullAbdApplyPolicy::Cooperative16;
+}
+
 void launch_fused_pcg_update_convergence(muda::CVarView<Float> rz_old,
                                          muda::CVarView<Float> rz_new,
                                          muda::VarView<Float>  beta,
@@ -308,6 +438,37 @@ void launch_fused_pcg_update_p_prepare_next(muda::DenseVectorView<Float>  p,
         rz_old_next.data(),
         rz_new_next.data(),
         status.data(),
+        params.data(),
+        iteration_in_chunk);
+}
+
+void launch_fused_pcg_convergence_update_p_prepare_next(
+    muda::DenseVectorView<Float>         p,
+    muda::CDenseVectorView<Float>        z,
+    muda::CVarView<Float>                rz_old,
+    muda::CVarView<Float>                rz_new,
+    muda::VarView<Float>                 beta,
+    muda::VarView<Float>                 rz_old_next,
+    muda::VarView<Float>                 rz_new_next,
+    muda::VarView<IndexT>                status,
+    muda::VarView<FusedPcgCheckState>    check_state,
+    muda::CVarView<FusedPcgDeviceParams> params,
+    IndexT                               iteration_in_chunk,
+    cudaStream_t                         stream)
+{
+    const int grid_size =
+        p.size() == 0 ? 1 : static_cast<int>((p.size() + PcgVectorBlockSize - 1) / PcgVectorBlockSize);
+    convergence_update_p_prepare_next_kernel<<<grid_size, PcgVectorBlockSize, 0, stream>>>(
+        p.data(),
+        z.data(),
+        p.size(),
+        rz_old.data(),
+        rz_new.data(),
+        beta.data(),
+        rz_old_next.data(),
+        rz_new_next.data(),
+        status.data(),
+        check_state.data(),
         params.data(),
         iteration_in_chunk);
 }
@@ -418,6 +579,7 @@ void launch_fused_pcg_full_abd_update_apply_dot(muda::CBufferView<Float> full_in
                                                 muda::VarView<Float>   rz_new,
                                                 muda::CVarView<IndexT> status,
                                                 muda::CVarView<FusedPcgDeviceParams> params,
+                                                FullAbdApplyPolicy policy,
                                                 IndexT       iteration_in_chunk,
                                                 cudaStream_t stream)
 {
@@ -430,12 +592,12 @@ void launch_fused_pcg_full_abd_update_apply_dot(muda::CBufferView<Float> full_in
                 full_inv.size(),
                 vector_size);
 
-    const int grid_size =
+    const int residual_grid_size =
         static_cast<int>((vector_size + PcgVectorBlockSize - 1) / PcgVectorBlockSize);
-    if(grid_size == 0)
+    if(residual_grid_size == 0)
         return;
 
-    full_abd_update_residual_kernel<<<grid_size, PcgVectorBlockSize, 0, stream>>>(
+    full_abd_update_residual_kernel<<<residual_grid_size, PcgVectorBlockSize, 0, stream>>>(
         x.data(),
         p.data(),
         r.data(),
@@ -446,15 +608,60 @@ void launch_fused_pcg_full_abd_update_apply_dot(muda::CBufferView<Float> full_in
         status.data(),
         params.data(),
         iteration_in_chunk);
-    full_abd_apply_dot_kernel<<<grid_size, PcgVectorBlockSize, 0, stream>>>(
-        full_inv.data(),
-        vector_size,
-        r.data(),
-        z.data(),
-        rz_new.data(),
-        status.data(),
-        params.data(),
-        iteration_in_chunk);
+
+    if(policy == FullAbdApplyPolicy::SingleLane)
+    {
+        const int apply_grid_size = static_cast<int>(
+            (vector_size + FullAbdSingleLaneBlockSize - 1) / FullAbdSingleLaneBlockSize);
+        full_abd_apply_dot_single_lane_kernel<<<apply_grid_size, FullAbdSingleLaneBlockSize, 0, stream>>>(
+            full_inv.data(),
+            vector_size,
+            r.data(),
+            z.data(),
+            rz_new.data(),
+            status.data(),
+            params.data(),
+            iteration_in_chunk);
+    }
+    else
+    {
+        constexpr int WarpsPerBlock = 2;
+        if(policy == FullAbdApplyPolicy::Cooperative32)
+        {
+            constexpr int WorkersPerRow = 32;
+            constexpr int RowsPerBlock  = (32 / WorkersPerRow) * WarpsPerBlock;
+            const int     apply_grid_size =
+                static_cast<int>((vector_size + RowsPerBlock - 1) / RowsPerBlock);
+            full_abd_apply_dot_kernel<WorkersPerRow, WarpsPerBlock>
+                <<<apply_grid_size, 32 * WarpsPerBlock, 0, stream>>>(full_inv.data(),
+                                                                     vector_size,
+                                                                     r.data(),
+                                                                     z.data(),
+                                                                     rz_new.data(),
+                                                                     status.data(),
+                                                                     params.data(),
+                                                                     iteration_in_chunk);
+        }
+        else
+        {
+            UIPC_ASSERT(policy == FullAbdApplyPolicy::Cooperative16,
+                        "invalid Full-ABD apply policy {}",
+                        static_cast<int>(policy));
+            constexpr int WorkersPerRow = 16;
+            constexpr int RowsPerBlock  = (32 / WorkersPerRow) * WarpsPerBlock;
+            const int     apply_grid_size =
+                static_cast<int>((vector_size + RowsPerBlock - 1) / RowsPerBlock);
+            full_abd_apply_dot_kernel<WorkersPerRow, WarpsPerBlock>
+                <<<apply_grid_size, 32 * WarpsPerBlock, 0, stream>>>(full_inv.data(),
+                                                                     vector_size,
+                                                                     r.data(),
+                                                                     z.data(),
+                                                                     rz_new.data(),
+                                                                     status.data(),
+                                                                     params.data(),
+                                                                     iteration_in_chunk);
+        }
+    }
 }
 
 void launch_fem_diag_preconditioner_apply(muda::CBufferView<Matrix3x3> diag_inv,

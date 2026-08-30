@@ -4,7 +4,7 @@
 #include <linear_system/global_linear_system.h>
 #include <uipc/common/timer.h>
 #include <cub/warp/warp_reduce.cuh>
-#include <linear_system/fused_pcg_kernels.h>
+#include "fused_pcg_kernels.h"
 #include <muda/check/check_cuda_errors.h>
 #include <algorithm>
 namespace uipc::backend::cuda
@@ -233,25 +233,19 @@ void LinearFusedPCG::launch_graph_iteration(muda::DenseVectorView<Float> x,
                                iteration_in_chunk,
                                stream);
 
-    launch_fused_pcg_update_convergence(resources.graph_rz_old[current_slot].view(),
-                                        resources.graph_rz_new[current_slot].view(),
-                                        resources.beta.view(),
-                                        d_converged.view(),
-                                        resources.check_state.view(),
-                                        resources.device_params.view(),
-                                        iteration_in_chunk,
-                                        stream);
-
-    launch_fused_pcg_update_p_prepare_next(p.view(),
-                                           z.cview(),
-                                           resources.beta.view(),
-                                           resources.graph_rz_new[current_slot].view(),
-                                           resources.graph_rz_old[next_slot].view(),
-                                           resources.graph_rz_new[next_slot].view(),
-                                           d_converged.view(),
-                                           resources.device_params.view(),
-                                           iteration_in_chunk,
-                                           stream);
+    launch_fused_pcg_convergence_update_p_prepare_next(
+        p.view(),
+        z.cview(),
+        resources.graph_rz_old[current_slot].view(),
+        resources.graph_rz_new[current_slot].view(),
+        resources.beta.view(),
+        resources.graph_rz_old[next_slot].view(),
+        resources.graph_rz_new[next_slot].view(),
+        d_converged.view(),
+        resources.check_state.view(),
+        resources.device_params.view(),
+        iteration_in_chunk,
+        stream);
 }
 
 SizeT LinearFusedPCG::graph_fused_pcg(muda::DenseVectorView<Float>  x,
