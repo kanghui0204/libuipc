@@ -41,7 +41,7 @@ void SimEngine::advance()
         if(m_global_trajectory_filter)
         {
             Timer timer{"Detect Trajectory Candidates"};
-            m_global_trajectory_filter->detect(alpha);
+            m_global_trajectory_filter->detect(alpha, true);
         }
     };
 
