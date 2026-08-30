@@ -3,6 +3,7 @@
 #include <collision_detection/info_stackless_bvh.h>
 #include <muda/buffer.h>
 #include <algorithm>
+#include <utility>
 #include <vector>
 
 using namespace muda;
@@ -26,7 +27,7 @@ struct PairSet
     }
 };
 
-void check_same_pairs(PairSet lhs, PairSet rhs)
+SizeT check_same_pairs(PairSet lhs, PairSet rhs)
 {
     lhs.sort();
     rhs.sort();
@@ -36,6 +37,7 @@ void check_same_pairs(PairSet lhs, PairSet rhs)
         CHECK(lhs.values[i][0] == rhs.values[i][0]);
         CHECK(lhs.values[i][1] == rhs.values[i][1]);
     }
+    return lhs.values.size();
 }
 
 struct NodePred
@@ -158,6 +160,66 @@ Inputs swept_inputs(IndexT count, double phase)
         result.aabbs.push_back(box_at(x, 0.65));
         result.bids.push_back((i + 3) % 9);
         result.cids.push_back((i + 1) % 4);
+    }
+    return result;
+}
+
+enum class MetadataPhase
+{
+    Homogeneous,
+    DifferentHomogeneous,
+    Mixed
+};
+
+Inputs grouped_inputs(IndexT count, MetadataPhase phase, bool reverse_groups)
+{
+    constexpr IndexT group_size = 3;
+    REQUIRE(count % group_size == 0);
+
+    Inputs result;
+    result.aabbs.reserve(count);
+    result.bids.reserve(count);
+    result.cids.reserve(count);
+
+    IndexT group_count = count / group_size;
+    for(IndexT i = 0; i < count; ++i)
+    {
+        IndexT group         = i / group_size;
+        IndexT local         = i % group_size;
+        IndexT spatial_group = reverse_groups ? group_count - 1 - group : group;
+        double x = 10.0 * spatial_group + 0.15 * local;
+        result.aabbs.push_back(box_at(x, 0.2));
+
+        switch(phase)
+        {
+            case MetadataPhase::Homogeneous:
+                result.bids.push_back(17);
+                result.cids.push_back(1);
+                break;
+            case MetadataPhase::DifferentHomogeneous:
+                result.bids.push_back(29);
+                result.cids.push_back(2);
+                break;
+            case MetadataPhase::Mixed:
+                result.bids.push_back(i);
+                result.cids.push_back(local);
+                break;
+        }
+    }
+    return result;
+}
+
+Inputs grouped_queries(IndexT group_count, IndexT bid, IndexT cid)
+{
+    Inputs result;
+    result.aabbs.reserve(group_count);
+    result.bids.reserve(group_count);
+    result.cids.reserve(group_count);
+    for(IndexT group = 0; group < group_count; ++group)
+    {
+        result.aabbs.push_back(box_at(10.0 * group + 0.15, 0.4));
+        result.bids.push_back(bid);
+        result.cids.push_back(cid);
     }
     return result;
 }
@@ -291,5 +353,85 @@ TEST_CASE("info_stackless_bvh_refit", "[LS11][line_search][bvh]")
         auto changed = swept_inputs(9, 0.0);
         upload(changed, aabbs, bids, cids);
         CHECK_FALSE(bvh.refit(aabbs, bids, cids));
+    }
+
+    SECTION("cross_cta_metadata_transitions_and_overflow")
+    {
+        constexpr IndexT primitive_count = 1536;
+        constexpr IndexT group_size      = 3;
+        static_assert(primitive_count > 1024);
+
+        DeviceBuffer<AABB>   refit_aabbs;
+        DeviceBuffer<IndexT> refit_bids;
+        DeviceBuffer<IndexT> refit_cids;
+        upload(grouped_inputs(
+                   primitive_count, MetadataPhase::Homogeneous, false),
+               refit_aabbs,
+               refit_bids,
+               refit_cids);
+
+        InfoStacklessBVH refitted;
+        refitted.build(refit_aabbs, refit_bids, refit_cids);
+
+        auto compare_refit_with_rebuild =
+            [&](const Inputs& state, const Inputs& query)
+        {
+            upload(state, refit_aabbs, refit_bids, refit_cids);
+            REQUIRE(refitted.refit(refit_aabbs, refit_bids, refit_cids));
+
+            DeviceBuffer<AABB>   rebuilt_aabbs;
+            DeviceBuffer<IndexT> rebuilt_bids;
+            DeviceBuffer<IndexT> rebuilt_cids;
+            upload(state, rebuilt_aabbs, rebuilt_bids, rebuilt_cids);
+            InfoStacklessBVH rebuilt;
+            rebuilt.build(rebuilt_aabbs, rebuilt_bids, rebuilt_cids);
+
+            SizeT self_count =
+                check_same_pairs(detect_pairs(refitted, d_cmts.view()),
+                                 detect_pairs(rebuilt, d_cmts.view()));
+
+            DeviceBuffer<AABB>   query_aabbs;
+            DeviceBuffer<IndexT> query_bids;
+            DeviceBuffer<IndexT> query_cids;
+            upload(query, query_aabbs, query_bids, query_cids);
+            SizeT other_count = check_same_pairs(
+                query_pairs(refitted,
+                            query_aabbs,
+                            query_bids,
+                            query_cids,
+                            d_cmts.view()),
+                query_pairs(rebuilt,
+                            query_aabbs,
+                            query_bids,
+                            query_cids,
+                            d_cmts.view()));
+            return std::pair{self_count, other_count};
+        };
+
+        // Every internal node starts with valid BID/CID metadata (17, 1).
+        // The first refit must replace it with a different valid pair (29, 2).
+        // Querying with the old metadata makes any stale internal value visible
+        // as an incorrect cull.
+        auto different = grouped_inputs(
+            primitive_count, MetadataPhase::DifferentHomogeneous, true);
+        auto query_old_homogeneous =
+            grouped_queries(primitive_count / group_size, 17, 2);
+        auto [different_self, different_other] =
+            compare_refit_with_rebuild(different, query_old_homogeneous);
+        CHECK(different_self == 0);
+        CHECK(different_other > 1);
+
+        // The second refit mixes BID/CID values, so internal metadata becomes
+        // invalid. Querying with the previous valid pair catches stale values.
+        // Both result sets exceed reserve(1), mechanically exercising the
+        // production overflow/retry path without quadratic output.
+        auto mixed =
+            grouped_inputs(primitive_count, MetadataPhase::Mixed, false);
+        auto query_old_different =
+            grouped_queries(primitive_count / group_size, 29, 1);
+        auto [mixed_self, mixed_other] =
+            compare_refit_with_rebuild(mixed, query_old_different);
+        CHECK(mixed_self > 1);
+        CHECK(mixed_other > 1);
     }
 }
