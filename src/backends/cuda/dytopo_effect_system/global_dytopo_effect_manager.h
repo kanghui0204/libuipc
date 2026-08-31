@@ -6,6 +6,7 @@
 #include <utils/offset_count_collection.h>
 #include <algorithm/matrix_converter.h>
 #include <dytopo_effect_system/dytopo_classify_info.h>
+#include <dytopo_effect_system/dytopo_distribution.h>
 
 namespace uipc::backend::cuda
 {
@@ -153,9 +154,18 @@ class GlobalDyTopoEffectManager final : public SimSystem
 
         SimSystemSlotCollection<DyTopoEffectReceiver> dytopo_effect_receivers;
 
-        muda::DeviceVar<Vector2i>  gradient_range;
-        muda::DeviceBuffer<IndexT> selected_hessian;
-        muda::DeviceBuffer<IndexT> selected_hessian_offsets;
+        muda::DeviceBuffer<dytopo_distribution::DistributionQuery>
+            distribution_queries;
+        muda::DeviceBuffer<dytopo_distribution::DistributionResult>
+            distribution_results;
+        muda::DeviceBuffer<IndexT> selected_hessian_virtual_indices;
+        muda::DeviceVar<IndexT>    selected_hessian_total_count;
+
+        vector<DyTopoClassifyInfo> receiver_classify_infos;
+        vector<dytopo_distribution::DistributionQuery>
+            host_distribution_queries;
+        vector<dytopo_distribution::DistributionResult>
+            host_distribution_results;
 
         vector<muda::DeviceTripletMatrix<Float, 3>> classified_dytopo_effect_hessians;
         vector<muda::DeviceDoubletVector<Float, 3>> classified_dytopo_effect_gradients;
