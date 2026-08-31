@@ -20,6 +20,7 @@ class ABDDiagPreconditioner final : public LocalPreconditioner
     muda::DeviceBuffer<Matrix12x12> diag_inv;
     muda::DeviceBuffer<Float>       full_inv;
     bool                            use_full_block = false;
+    FullAbdApplyPolicy full_abd_apply_policy = FullAbdApplyPolicy::SingleLane;
 
     virtual void do_build(BuildInfo& info) override
     {
@@ -50,7 +51,10 @@ class ABDDiagPreconditioner final : public LocalPreconditioner
                    { diag_inv(i) = muda::eigen::inverse(diag_hessian(i)); });
 
         if(!use_full_block)
+        {
+            full_abd_apply_policy = FullAbdApplyPolicy::SingleLane;
             return;
+        }
 
         // Freeze the first positive-definite ABD block as a reference
         // preconditioner. PCG still multiplies by the current matrix and only
@@ -94,6 +98,7 @@ class ABDDiagPreconditioner final : public LocalPreconditioner
                 "ABDDiagPreconditioner: full ABD block is not positive definite; "
                 "falling back to 12x12 block Jacobi");
             full_inv.resize(0);
+            full_abd_apply_policy = FullAbdApplyPolicy::SingleLane;
             return;
         }
 
@@ -104,12 +109,17 @@ class ABDDiagPreconditioner final : public LocalPreconditioner
                 "ABDDiagPreconditioner: full ABD inverse is invalid; "
                 "falling back to 12x12 block Jacobi");
             full_inv.resize(0);
+            full_abd_apply_policy = FullAbdApplyPolicy::SingleLane;
             return;
         }
 
         full_inv.resize(dof_count * dof_count);
         full_inv.view().copy_from(inverse.data());
-        logger::info("ABDDiagPreconditioner: enabled full {}x{} ABD block", dof_count, dof_count);
+        full_abd_apply_policy = select_full_abd_apply_policy(dof_count);
+        logger::info("ABDDiagPreconditioner: enabled full {}x{} ABD block with apply policy {}",
+                     dof_count,
+                     dof_count,
+                     static_cast<int>(full_abd_apply_policy));
     }
 
     virtual void do_apply(GlobalLinearSystem::ApplyPreconditionerInfo& info) override
@@ -155,6 +165,7 @@ class ABDDiagPreconditioner final : public LocalPreconditioner
         combine(static_cast<SizeT>(full_mode));
         combine(reinterpret_cast<SizeT>(full_inv.data()));
         combine(static_cast<SizeT>(full_inv.size()));
+        combine(static_cast<SizeT>(full_abd_apply_policy));
         combine(reinterpret_cast<SizeT>(diag_inv.data()));
         combine(static_cast<SizeT>(diag_inv.size()));
         return seed;
@@ -175,6 +186,7 @@ class ABDDiagPreconditioner final : public LocalPreconditioner
                                                        info.rz_new(),
                                                        info.status(),
                                                        info.params(),
+                                                       full_abd_apply_policy,
                                                        info.iteration_in_chunk(),
                                                        info.stream());
             return;
