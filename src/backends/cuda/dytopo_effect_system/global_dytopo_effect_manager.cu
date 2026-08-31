@@ -2,6 +2,10 @@
 #include <dytopo_effect_system/global_dytopo_effect_manager.h>
 #include <dytopo_effect_system/dytopo_effect_reporter.h>
 #include <dytopo_effect_system/dytopo_effect_receiver.h>
+#include <dytopo_effect_system/dytopo_distribution.h>
+#include <muda/buffer/buffer_launch.h>
+#include <muda/cub/device/device_select.h>
+#include <cub/iterator/counting_input_iterator.cuh>
 #include <uipc/common/enumerate.h>
 #include <kernel_cout.h>
 #include <uipc/common/unit.h>
@@ -72,8 +76,14 @@ void GlobalDyTopoEffectManager::Impl::init(WorldVisitor& world)
     for(auto&& [i, R] : enumerate(dytopo_effect_receiver_view))
         R->m_index = i;
 
-    classified_dytopo_effect_gradients.resize(dytopo_effect_receiver_view.size());
-    classified_dytopo_effect_hessians.resize(dytopo_effect_receiver_view.size());
+    const auto receiver_count = dytopo_effect_receiver_view.size();
+    receiver_classify_infos.resize(receiver_count);
+    host_distribution_queries.resize(receiver_count);
+    host_distribution_results.resize(receiver_count);
+    distribution_queries.resize(receiver_count);
+    distribution_results.resize(receiver_count);
+    classified_dytopo_effect_hessians.resize(receiver_count);
+    classified_dytopo_effect_gradients.resize(receiver_count);
 }
 
 void GlobalDyTopoEffectManager::Impl::compute_dytopo_effect(ComputeDyTopoEffectInfo& info)
@@ -172,94 +182,218 @@ void GlobalDyTopoEffectManager::Impl::_distribute(ComputeDyTopoEffectInfo& info)
 
     using namespace muda;
 
-    auto vertex_count = global_vertex_manager->positions().size();
+    const auto vertex_count = global_vertex_manager->positions().size();
+    const auto receivers    = dytopo_effect_receivers.view();
 
-    for(auto&& [i, receiver] : enumerate(dytopo_effect_receivers.view()))
+    const auto sorted_gradient =
+        std::as_const(sorted_dytopo_effect_gradient).view();
+    const auto sorted_hessian =
+        std::as_const(sorted_dytopo_effect_hessian).view();
+    const IndexT gradient_count = sorted_gradient.doublet_count();
+    const IndexT hessian_count  = sorted_hessian.triplet_count();
+
+    UIPC_ASSERT(sorted_gradient.total_extent() == vertex_count,
+                "Sorted DyTopo gradient extent mismatch, expected {}, got {}",
+                vertex_count,
+                sorted_gradient.total_extent());
+    UIPC_ASSERT(sorted_hessian.total_rows() == vertex_count
+                    && sorted_hessian.total_cols() == vertex_count,
+                "Sorted DyTopo Hessian extent mismatch, expected {}x{}, got {}x{}",
+                vertex_count,
+                vertex_count,
+                sorted_hessian.total_rows(),
+                sorted_hessian.total_cols());
+
+    const SizeT receiver_count_size = receivers.size();
+    IndexT      hessian_virtual_count;
+    const bool  virtual_count_is_valid =
+        dytopo_distribution::checked_hessian_virtual_count(
+            receiver_count_size, hessian_count, hessian_virtual_count);
+    UIPC_ASSERT(virtual_count_is_valid,
+                "DyTopo Hessian selection size overflow: receiver_count={}, "
+                "hessian_count={}",
+                receiver_count_size,
+                hessian_count);
+    if(!virtual_count_is_valid)
+        return;
+
+    const IndexT receiver_count = static_cast<IndexT>(receiver_count_size);
+
+    // Stage 1: collect every receiver's query before launching shared GPU work.
+    // report() must only describe classification ranges and must not depend on a
+    // previous receiver's receive() side effects.
+    bool has_diag_receiver    = false;
+    bool has_hessian_receiver = false;
+    for(auto&& [i, receiver] : enumerate(receivers))
     {
-        DyTopoClassifyInfo classify_info;
+        // Clear all per-call metadata before report() so no range can leak
+        // across full, gradient-only, or empty-input calls.
+        receiver_classify_infos[i] = DyTopoClassifyInfo{};
+        host_distribution_results[i] =
+            dytopo_distribution::empty_distribution_result();
+
+        auto& classify_info = receiver_classify_infos[i];
         receiver->report(classify_info);
 
+        host_distribution_queries[i] =
+            dytopo_distribution::make_distribution_query(
+                classify_info.gradient_i_range(),
+                classify_info.hessian_i_range(),
+                classify_info.hessian_j_range());
 
-        ClassifiedDyTopoEffectInfo classified_info;
+        has_diag_receiver |= classify_info.is_diag();
+        has_hessian_receiver |= !classify_info.is_empty();
+    }
+
+    const bool has_gradient_work = has_diag_receiver && gradient_count > 0;
+    const bool has_hessian_work = !info.m_gradient_only
+                                  && has_hessian_receiver
+                                  && hessian_count > 0
+                                  && receiver_count > 0;
+    const bool has_metadata_work =
+        receiver_count > 0 && (has_gradient_work || has_hessian_work);
+    IndexT selected_hessian_count = 0;
+
+    // DeviceSelect's output allocation is conservatively R*N. Reuse capacity
+    // across calls, but reset the logical size on every path (including N=0 and
+    // gradient_only) so stale selections can never be consumed.
+    loose_resize(selected_hessian_virtual_indices,
+                 has_hessian_work ? hessian_virtual_count : 0);
+
+    if(has_metadata_work)
+    {
+        // Queries remain alive until the single D2H wait below. The H2D copy,
+        // DeviceSelect, result-query kernel, and D2H copy all use the default
+        // stream and therefore execute in order.
+        BufferLaunch().copy(distribution_queries.view(),
+                            host_distribution_queries.data());
+
+        if(has_hessian_work)
+        {
+            cub::CountingInputIterator<IndexT> virtual_indices{0};
+
+            // The virtual input order is receiver-major: q = receiver*N + k.
+            // CUB DeviceSelect is stable, so the compact output is grouped by
+            // receiver and preserves each receiver's original Hessian order.
+            DeviceSelect().If(
+                virtual_indices,
+                selected_hessian_virtual_indices.data(),
+                selected_hessian_total_count.data(),
+                hessian_virtual_count,
+                dytopo_distribution::HessianRangePredicate{
+                    sorted_hessian.row_indices().data(),
+                    sorted_hessian.col_indices().data(),
+                    distribution_queries.data(),
+                    hessian_count});
+        }
+
+        ParallelFor()
+            .file_line(__FILE__, __LINE__)
+            .apply(receiver_count,
+                   [gradient_indices = sorted_gradient.indices().cviewer().name(
+                        "sorted_dytopo_gradient_indices"),
+                    selected_hessian_virtual_indices =
+                        selected_hessian_virtual_indices.cviewer().name(
+                            "selected_hessian_virtual_indices"),
+                    queries = distribution_queries.cviewer().name(
+                        "dytopo_distribution_queries"),
+                    results = distribution_results.viewer().name(
+                        "dytopo_distribution_results"),
+                    selected_hessian_total_count =
+                        selected_hessian_total_count.cviewer().name(
+                            "selected_hessian_total_count"),
+                    gradient_count,
+                    hessian_count,
+                    has_gradient_work,
+                    has_hessian_work] __device__(IndexT receiver_index) mutable
+                   {
+                       auto result =
+                           dytopo_distribution::empty_distribution_result();
+                       const auto query = queries(receiver_index);
+
+                       if(has_gradient_work)
+                       {
+                           result.gradient_entry_range =
+                               dytopo_distribution::query_sorted_gradient_range(
+                                   gradient_indices,
+                                   gradient_count,
+                                   query.gradient_range);
+                       }
+
+                       if(has_hessian_work)
+                       {
+                           result.hessian_selection_range =
+                               dytopo_distribution::query_selected_hessian_range(
+                                   selected_hessian_virtual_indices,
+                                   *selected_hessian_total_count,
+                                   receiver_index,
+                                   hessian_count);
+                       }
+
+                       results(receiver_index) = result;
+                   });
+
+        // This is the only explicit host synchronization in distribution
+        // metadata: one D2H transfer returns every receiver's two compact ranges.
+        distribution_results.view().copy_to(host_distribution_results.data());
+
+        if(has_hessian_work)
+        {
+            // Receiver-major selection means the final receiver's exclusive
+            // end is exactly CUB's total selected count.
+            selected_hessian_count =
+                host_distribution_results.back().hessian_selection_range.y();
+            UIPC_ASSERT(selected_hessian_count >= 0
+                            && selected_hessian_count
+                                   <= selected_hessian_virtual_indices.size(),
+                        "Invalid DyTopo Hessian selected count {} for capacity {}",
+                        selected_hessian_count,
+                        selected_hessian_virtual_indices.size());
+        }
+    }
+
+    // Stage 2: materialize independent receiver-owned buffers. This preserves
+    // the lifetime contract used by receivers after this function returns.
+    for(auto&& [i, receiver] : enumerate(receivers))
+    {
+        const auto& classify_info = receiver_classify_infos[i];
+
+        // Value initialization guarantees empty gradient/Hessian views on
+        // every call, including off-diagonal and gradient-only receivers.
+        ClassifiedDyTopoEffectInfo classified_info{};
         auto& classified_gradients = classified_dytopo_effect_gradients[i];
-        classified_gradients.reshape(vertex_count);
         auto& classified_hessians = classified_dytopo_effect_hessians[i];
+        classified_gradients.reshape(vertex_count);
         classified_hessians.reshape(vertex_count, vertex_count);
 
         // 1) report gradient
         if(classify_info.is_diag())
         {
-            const auto N = sorted_dytopo_effect_gradient.doublet_count();
+            const auto range = host_distribution_results[i].gradient_entry_range;
+            const auto count = range.y() - range.x();
 
-            // clear the range in device
-            gradient_range = Vector2i{0, 0};
-
-            // partition
-            ParallelFor()
-                .file_line(__FILE__, __LINE__)
-                .apply(
-                    N,
-                    [gradient_range = gradient_range.viewer().name("gradient_range"),
-                     dytopo_effect_gradient =
-                         std::as_const(sorted_dytopo_effect_gradient).viewer().name("dytopo_effect_gradient"),
-                     range = classify_info.gradient_i_range()] __device__(int I) mutable
-                    {
-                        auto in_range = [](int i, const Vector2i& range)
-                        { return i >= range.x() && i < range.y(); };
-
-                        auto&& [i, G]      = dytopo_effect_gradient(I);
-                        bool this_in_range = in_range(i, range);
-
-                        if(!this_in_range)
-                        {
-                            return;
-                        }
-
-                        bool prev_in_range = false;
-                        if(I > 0)
-                        {
-                            auto&& [prev_i, prev_G] = dytopo_effect_gradient(I - 1);
-                            prev_in_range = in_range(prev_i, range);
-                        }
-                        bool next_in_range = false;
-                        if(I < dytopo_effect_gradient.total_doublet_count() - 1)
-                        {
-                            auto&& [next_i, next_G] = dytopo_effect_gradient(I + 1);
-                            next_in_range = in_range(next_i, range);
-                        }
-
-                        // if the prev is not in range, then this is the start of the partition
-                        if(!prev_in_range)
-                        {
-                            gradient_range->x() = I;
-                        }
-                        // if the next is not in range, then this is the end of the partition
-                        if(!next_in_range)
-                        {
-                            gradient_range->y() = I + 1;
-                        }
-                    });
-
-            Vector2i h_range = gradient_range;  // copy back
-
-            auto count = h_range.y() - h_range.x();
+            UIPC_ASSERT(range.x() >= 0 && range.x() <= range.y()
+                            && range.y() <= gradient_count,
+                        "Invalid sorted DyTopo gradient subview [{}, {}) for count {}",
+                        range.x(),
+                        range.y(),
+                        gradient_count);
 
             loose_resize_entries(classified_gradients, count);
 
-            // fill
             if(count > 0)
             {
                 ParallelFor()
                     .file_line(__FILE__, __LINE__)
                     .apply(count,
-                           [dytopo_effect_gradient = std::as_const(sorted_dytopo_effect_gradient)
-                                                         .viewer()
-                                                         .name("dytopo_effect_gradient"),
-                            classified_gradient = classified_gradients.viewer().name("classified_gradient"),
-                            range = h_range] __device__(int I) mutable
+                           [sorted_gradient = sorted_gradient.cviewer().name(
+                                "sorted_dytopo_effect_gradient"),
+                            classified_gradient = classified_gradients.viewer().name(
+                                "classified_gradient"),
+                            begin = range.x()] __device__(IndexT I) mutable
                            {
-                               auto&& [i, G] = dytopo_effect_gradient(range.x() + I);
-                               classified_gradient(I).write(i, G);
+                               auto&& [index, value] = sorted_gradient(begin + I);
+                               classified_gradient(I).write(index, value);
                            });
             }
 
@@ -269,71 +403,54 @@ void GlobalDyTopoEffectManager::Impl::_distribute(ComputeDyTopoEffectInfo& info)
         // 2) report hessian
         if(!info.m_gradient_only && !classify_info.is_empty())
         {
-            const auto N = sorted_dytopo_effect_hessian.triplet_count();
+            const auto range =
+                host_distribution_results[i].hessian_selection_range;
+            const auto count = range.y() - range.x();
 
-            // +1 for calculate the total count
-            loose_resize(selected_hessian, N + 1);
-            loose_resize(selected_hessian_offsets, N + 1);
+            UIPC_ASSERT(
+                range.x() >= 0 && range.x() <= range.y()
+                    && range.y() <= selected_hessian_count,
+                "Invalid compact DyTopo Hessian range [{}, {}) for selection "
+                "count {}",
+                range.x(),
+                range.y(),
+                selected_hessian_count);
 
-            // select
-            ParallelFor()
-                .file_line(__FILE__, __LINE__)
-                .apply(
-                    N,
-                    [selected_hessian = selected_hessian.view(0, N).viewer().name("selected_hessian"),
-                     last =
-                         VarView<IndexT>{selected_hessian.data() + N}.viewer().name("last"),
-                     dytopo_effect_hessian =
-                         sorted_dytopo_effect_hessian.cviewer().name("dytopo_effect_hessian"),
-                     i_range = classify_info.hessian_i_range(),
-                     j_range = classify_info.hessian_j_range()] __device__(int I) mutable
-                    {
-                        auto&& [i, j, H] = dytopo_effect_hessian(I);
+            loose_resize_entries(classified_hessians, count);
 
-                        auto in_range = [](int i, const Vector2i& range)
-                        { return i >= range.x() && i < range.y(); };
-
-                        selected_hessian(I) =
-                            in_range(i, i_range) && in_range(j, j_range) ? 1 : 0;
-
-                        // fill the last one as 0, so that we can calculate the total count
-                        // during the exclusive scan
-                        if(I == 0)
-                            last = 0;
-                    });
-
-            // scan
-            DeviceScan().ExclusiveSum(selected_hessian.data(),
-                                      selected_hessian_offsets.data(),
-                                      selected_hessian.size());
-
-            IndexT h_total_count = 0;
-            VarView<IndexT>{selected_hessian_offsets.data() + N}.copy_to(&h_total_count);
-
-            loose_resize_entries(classified_hessians, h_total_count);
-
-            // fill
-            if(h_total_count > 0)
+            if(count > 0)
             {
+                const IndexT receiver_index = static_cast<IndexT>(i);
                 ParallelFor()
                     .file_line(__FILE__, __LINE__)
-                    .apply(N,
-                           [selected_hessian = selected_hessian.cviewer().name("selected_hessian"),
-                            selected_hessian_offsets =
-                                selected_hessian_offsets.cviewer().name("selected_hessian_offsets"),
-                            dytopo_effect_hessian =
-                                sorted_dytopo_effect_hessian.cviewer().name("dytopo_effect_hessian"),
-                            classified_hessian = classified_hessians.viewer().name("classified_hessian"),
-                            i_range = classify_info.hessian_i_range(),
-                            j_range = classify_info.hessian_j_range()] __device__(int I) mutable
+                    .apply(count,
+                           [selected_hessian_virtual_indices =
+                                selected_hessian_virtual_indices.cviewer().name(
+                                    "selected_hessian_virtual_indices"),
+                            sorted_hessian = sorted_hessian.cviewer().name(
+                                "sorted_dytopo_effect_hessian"),
+                            classified_hessian = classified_hessians.viewer().name(
+                                "classified_hessian"),
+                            begin = range.x(),
+                            receiver_index,
+                            hessian_count] __device__(IndexT I) mutable
                            {
-                               if(selected_hessian(I))
-                               {
-                                   auto&& [i, j, H] = dytopo_effect_hessian(I);
-                                   auto offset = selected_hessian_offsets(I);
+                               const IndexT virtual_index =
+                                   selected_hessian_virtual_indices(begin + I);
+                               const IndexT source_index =
+                                   virtual_index - receiver_index * hessian_count;
 
-                                   classified_hessian(offset).write(i, j, H);
-                               }
+                               MUDA_KERNEL_ASSERT(
+                                   source_index >= 0
+                                       && source_index < hessian_count,
+                                   "DyTopo selected Hessian source index out of "
+                                   "range: source=%d, count=%d",
+                                   source_index,
+                                   hessian_count);
+
+                               auto&& [row, col, value] =
+                                   sorted_hessian(source_index);
+                               classified_hessian(I).write(row, col, value);
                            });
             }
 
