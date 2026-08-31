@@ -10,7 +10,9 @@ namespace uipc::backend::cuda
 {
 namespace
 {
-    constexpr int PcgVectorBlockSize = 64;
+    constexpr int PcgVectorBlockSize        = 64;
+    constexpr int FullAbdCooperativeMinSize = 48;
+    constexpr int StrongFp64MaxRatio        = 4;
     constexpr IndexT PcgPrepareClaimed = std::numeric_limits<IndexT>::min();
     static_assert(static_cast<IndexT>(FusedPcgStatus::Running) == 0);
 
@@ -322,6 +324,67 @@ namespace
             atomicAdd(rz_new, block_sum);
     }
 
+    template <int WorkersPerRow, int WarpsPerBlock>
+    __global__ void full_abd_apply_dot_cooperative_kernel(
+        const Float* __restrict__ full_inv,
+        SizeT vector_size,
+        const Float* __restrict__ r,
+        Float* __restrict__ z,
+        Float* __restrict__ rz_new,
+        const IndexT* __restrict__ status,
+        const FusedPcgDeviceParams* __restrict__ params,
+        IndexT iteration_in_chunk)
+    {
+        constexpr int RowsPerWarp  = 32 / WorkersPerRow;
+        constexpr int RowsPerBlock = RowsPerWarp * WarpsPerBlock;
+        static_assert(WorkersPerRow * RowsPerWarp == 32);
+
+        __shared__ Float warp_dots[WarpsPerBlock];
+        const int        lane        = threadIdx.x & 31;
+        const int        warp        = threadIdx.x >> 5;
+        const int        row_in_warp = lane % RowsPerWarp;
+        const int        worker      = lane / RowsPerWarp;
+        const SizeT      row = static_cast<SizeT>(blockIdx.x) * RowsPerBlock
+                          + warp * RowsPerWarp + row_in_warp;
+        const bool running = iteration_is_active(params, iteration_in_chunk)
+                             && *status == static_cast<IndexT>(FusedPcgStatus::Running);
+
+        Float z_value = 0.0;
+        if(running && row < vector_size)
+        {
+            for(SizeT col = worker; col < vector_size; col += WorkersPerRow)
+                z_value = fma(full_inv[row + col * vector_size], r[col], z_value);
+        }
+
+#pragma unroll
+        for(int offset = 16; offset >= RowsPerWarp; offset >>= 1)
+            z_value += __shfl_down_sync(0xffffffffu, z_value, offset);
+
+        Float local_dot = 0.0;
+        if(worker == 0 && running && row < vector_size)
+        {
+            z[row]    = z_value;
+            local_dot = r[row] * z_value;
+        }
+
+#pragma unroll
+        for(int offset = 16; offset > 0; offset >>= 1)
+            local_dot += __shfl_down_sync(0xffffffffu, local_dot, offset);
+        if(lane == 0)
+            warp_dots[warp] = local_dot;
+        __syncthreads();
+
+        if(threadIdx.x == 0)
+        {
+            Float block_dot = 0.0;
+#pragma unroll
+            for(int i = 0; i < WarpsPerBlock; ++i)
+                block_dot += warp_dots[i];
+            if(block_dot != Float{0.0})
+                atomicAdd(rz_new, block_dot);
+        }
+    }
+
     __global__ void fem_fused_update_apply_dot_kernel(const Matrix3x3* __restrict__ diag_inv,
                                                       SizeT vertex_count,
                                                       Float* __restrict__ x,
@@ -368,6 +431,23 @@ namespace
             atomicAdd(rz_new, block_sum);
     }
 }  // namespace
+
+FullAbdApplyPolicy select_full_abd_apply_policy(SizeT vector_size)
+{
+    if(vector_size < FullAbdCooperativeMinSize)
+        return FullAbdApplyPolicy::SingleLane;
+
+    int device                           = 0;
+    int single_to_double_precision_ratio = 0;
+    checkCudaErrors(cudaGetDevice(&device));
+    checkCudaErrors(cudaDeviceGetAttribute(&single_to_double_precision_ratio,
+                                           cudaDevAttrSingleToDoublePrecisionPerfRatio,
+                                           device));
+
+    return single_to_double_precision_ratio <= StrongFp64MaxRatio ?
+               FullAbdApplyPolicy::Cooperative32 :
+               FullAbdApplyPolicy::Cooperative16;
+}
 
 void launch_fused_pcg_update_convergence(muda::CVarView<Float> rz_old,
                                          muda::CVarView<Float> rz_new,
@@ -556,6 +636,7 @@ void launch_fused_pcg_full_abd_update_apply_dot(muda::CBufferView<Float> full_in
                                                 muda::VarView<Float>   rz_new,
                                                 muda::CVarView<IndexT> status,
                                                 muda::CVarView<FusedPcgDeviceParams> params,
+                                                FullAbdApplyPolicy policy,
                                                 IndexT       iteration_in_chunk,
                                                 cudaStream_t stream)
 {
@@ -584,15 +665,59 @@ void launch_fused_pcg_full_abd_update_apply_dot(muda::CBufferView<Float> full_in
         status.data(),
         params.data(),
         iteration_in_chunk);
-    full_abd_apply_dot_kernel<<<grid_size, PcgVectorBlockSize, 0, stream>>>(
-        full_inv.data(),
-        vector_size,
-        r.data(),
-        z.data(),
-        rz_new.data(),
-        status.data(),
-        params.data(),
-        iteration_in_chunk);
+    if(policy == FullAbdApplyPolicy::SingleLane)
+    {
+        full_abd_apply_dot_kernel<<<grid_size, PcgVectorBlockSize, 0, stream>>>(
+            full_inv.data(),
+            vector_size,
+            r.data(),
+            z.data(),
+            rz_new.data(),
+            status.data(),
+            params.data(),
+            iteration_in_chunk);
+    }
+    else
+    {
+        constexpr int WarpsPerBlock = 2;
+        if(policy == FullAbdApplyPolicy::Cooperative32)
+        {
+            constexpr int WorkersPerRow = 32;
+            constexpr int RowsPerBlock  = (32 / WorkersPerRow) * WarpsPerBlock;
+            const int apply_grid_size = static_cast<int>(
+                (vector_size + RowsPerBlock - 1) / RowsPerBlock);
+            full_abd_apply_dot_cooperative_kernel<WorkersPerRow, WarpsPerBlock>
+                <<<apply_grid_size, 32 * WarpsPerBlock, 0, stream>>>(
+                    full_inv.data(),
+                    vector_size,
+                    r.data(),
+                    z.data(),
+                    rz_new.data(),
+                    status.data(),
+                    params.data(),
+                    iteration_in_chunk);
+        }
+        else
+        {
+            UIPC_ASSERT(policy == FullAbdApplyPolicy::Cooperative16,
+                        "invalid Full-ABD apply policy {}",
+                        static_cast<int>(policy));
+            constexpr int WorkersPerRow = 16;
+            constexpr int RowsPerBlock  = (32 / WorkersPerRow) * WarpsPerBlock;
+            const int apply_grid_size = static_cast<int>(
+                (vector_size + RowsPerBlock - 1) / RowsPerBlock);
+            full_abd_apply_dot_cooperative_kernel<WorkersPerRow, WarpsPerBlock>
+                <<<apply_grid_size, 32 * WarpsPerBlock, 0, stream>>>(
+                    full_inv.data(),
+                    vector_size,
+                    r.data(),
+                    z.data(),
+                    rz_new.data(),
+                    status.data(),
+                    params.data(),
+                    iteration_in_chunk);
+        }
+    }
 }
 
 void launch_fem_diag_preconditioner_apply(muda::CBufferView<Matrix3x3> diag_inv,
