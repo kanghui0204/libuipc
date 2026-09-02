@@ -64,7 +64,7 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
 
         // Keep each contact type in its own CTA. The padding lanes return
         // immediately instead of sharing a warp with the next contact formula.
-        constexpr int BlockSize = 8;
+        constexpr int BlockSize = 16;
         const auto layout = make_contact_type_block_layout<BlockSize>(
             pt_count, ee_count, pe_count, pp_count);
         const IndexT pt_end       = layout.pt_end;
@@ -108,7 +108,7 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                  pe_end,
                 pp_offset] __device__(IndexT idx) mutable
                 {
-                    constexpr int SharedLanePitch = 8;
+                    constexpr int SharedLanePitch = 16;
                     __shared__ Float shared_h[12 * 12 * SharedLanePitch];
 
                     if(idx < pt_end)  // PT
@@ -310,7 +310,7 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                         AssembleCallable,
                         muda::Default>),
                 cudaFuncAttributePreferredSharedMemoryCarveout,
-                16);
+                32);
         checkCudaErrors(preferred_carveout_status);
 
         ParallelFor(BlockSize)
