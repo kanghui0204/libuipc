@@ -24,8 +24,10 @@ constexpr int K_SELF_QUEUE_SLOTS_PER_THREAD = 4;
 constexpr int K_SELF_MAX_RES_PER_BLOCK =
     K_SELF_THREADS * K_SELF_QUEUE_SLOTS_PER_THREAD;
 
-constexpr int K_OTHER_THREADS           = 256;
-constexpr int K_OTHER_MAX_RES_PER_BLOCK = 1024;
+constexpr int K_OTHER_THREADS                = 64;
+constexpr int K_OTHER_QUEUE_SLOTS_PER_THREAD = 4;
+constexpr int K_OTHER_MAX_RES_PER_BLOCK =
+    K_OTHER_THREADS * K_OTHER_QUEUE_SLOTS_PER_THREAD;
 
 static_assert(K_BUILD_THREADS % 32 == 0);
 static_assert(K_SELF_THREADS % 32 == 0);
