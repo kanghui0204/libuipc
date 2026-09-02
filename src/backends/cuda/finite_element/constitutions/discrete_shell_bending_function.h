@@ -76,7 +76,8 @@ namespace sym::discrete_shell_bending
         G = dEdtheta * dthetadx;
     }
 
-    inline UIPC_GENERIC void ddEddx(Matrix12x12&   H,
+    template <typename Hessian>
+    inline UIPC_GENERIC void ddEddx(Hessian&       H,
                                     const Vector3& x0,
                                     const Vector3& x1,
                                     const Vector3& x2,

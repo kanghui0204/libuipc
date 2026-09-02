@@ -2,7 +2,7 @@
 #include <uipc/builtin/attribute_name.h>
 #include <finite_element/constitutions/discrete_shell_bending_function.h>
 #include <numbers>
-#include <utils/make_spd.h>
+#include <utils/fixed_bank_soa_evd.h>
 #include <utils/matrix_assembler.h>
 #include <kernel_cout.h>
 
@@ -248,10 +248,8 @@ class DiscreteShellBending final : public FiniteElementExtraConstitution
         using namespace muda;
         namespace DSB = sym::discrete_shell_bending;
 
-        ParallelFor()
-            .file_line(__FILE__, __LINE__)
-            .apply(stencils.size(),
-                   [stencils = stencils.viewer().name("stencils"),
+        auto gradient_hessian_kernel =
+            [stencils = stencils.viewer().name("stencils"),
                     bending_stiffnesses = bending_stiffnesses.viewer().name("bending_stiffness"),
                     theta_bars = theta_bars.viewer().name("theta_bar"),
                     thicknesses = info.thicknesses().viewer().name("thicknesses"),
@@ -264,6 +262,9 @@ class DiscreteShellBending final : public FiniteElementExtraConstitution
                     dt     = info.dt(),
                     gradient_only = info.gradient_only()] __device__(int I) mutable
                    {
+                       constexpr int SharedLanePitch = 16;
+                       __shared__ Float shared_h[12 * 12 * SharedLanePitch];
+
                        Vector4i stencil   = stencils(I);
                        Float    kappa     = bending_stiffnesses(I);
                        Float    L0        = L0s(I);
@@ -278,8 +279,7 @@ class DiscreteShellBending final : public FiniteElementExtraConstitution
 
                        Float Vdt2 = V_bar * dt * dt;
 
-                       Vector12    G12;
-                       Matrix12x12 H12x12;
+                       Vector12 G12;
 
                        DSB::dEdx(G12, x0, x1, x2, x3, L0, h_bar, theta_bar, kappa);
                        G12 *= Vdt2;
@@ -289,13 +289,35 @@ class DiscreteShellBending final : public FiniteElementExtraConstitution
                        if(gradient_only)
                            return;
 
-                       DSB::ddEddx(H12x12, x0, x1, x2, x3, L0, h_bar, theta_bar, kappa);
+                       FixedBankSoAMap<12, SharedLanePitch> H12x12(
+                           shared_h + threadIdx.x);
+                       DSB::ddEddx(
+                           H12x12, x0, x1, x2, x3, L0, h_bar, theta_bar, kappa);
                        H12x12 *= Vdt2;
-                       make_spd(H12x12);
+                       Vector12 eigen_values;
+                       selfadjoint_evd_fixed_bank_shared<12>(H12x12, eigen_values);
 
                        TripletMatrixAssembler TMA{H3x3s};
-                       TMA.half_block<StencilSize>(I * HalfHessianSize).write(stencil, H12x12);
-                   });
+                       TMA.half_block<StencilSize>(I * HalfHessianSize)
+                           .write_psd_from_eigendecomposition(
+                               stencil, H12x12, eigen_values);
+                   };
+
+        using GradientHessianCallable =
+            std::decay_t<decltype(gradient_hessian_kernel)>;
+        static const cudaError_t preferred_carveout_status =
+            cudaFuncSetAttribute(
+                reinterpret_cast<const void*>(
+                    muda::details::parallel_for_kernel<
+                        GradientHessianCallable,
+                        muda::Default>),
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                64);
+        checkCudaErrors(preferred_carveout_status);
+
+        ParallelFor(16)
+            .file_line(__FILE__, __LINE__)
+            .apply(stencils.size(), std::move(gradient_hessian_kernel));
     }
 };
 
