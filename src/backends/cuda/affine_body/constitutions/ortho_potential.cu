@@ -1,6 +1,6 @@
 #include <affine_body/affine_body_constitution.h>
 #include <affine_body/constitutions/ortho_potential_function.h>
-#include <utils/make_spd.h>
+#include <utils/fixed_bank_soa_evd.h>
 
 
 namespace uipc::backend::cuda
@@ -84,10 +84,8 @@ class OrthoPotential final : public AffineBodyConstitution
 
         namespace AOP = sym::abd_ortho_potential;
 
-        ParallelFor()
-            .file_line(__FILE__, __LINE__)
-            .apply(N,
-                   [qs      = info.qs().cviewer().name("qs"),
+        auto gradient_hessian_kernel =
+            [qs      = info.qs().cviewer().name("qs"),
                     volumes = info.volumes().cviewer().name("volumes"),
                     gradients = info.gradients().viewer().name("shape_gradients"),
                     body_hessian = info.hessians().viewer().name("shape_hessian"),
@@ -95,8 +93,10 @@ class OrthoPotential final : public AffineBodyConstitution
                     dt     = info.dt(),
                     gradient_only] __device__(int i) mutable
                    {
-                       Matrix12x12 H = Matrix12x12::Zero();
-                       Vector12    G = Vector12::Zero();
+                       constexpr int SharedLanePitch = 16;
+                       __shared__ Float shared_h[9 * 9 * SharedLanePitch];
+
+                       Vector12 G = Vector12::Zero();
 
                        const auto& q      = qs(i);
                        Float       kappa  = kappas(i);
@@ -112,13 +112,33 @@ class OrthoPotential final : public AffineBodyConstitution
                        if(gradient_only)
                            return;
 
-                       Matrix9x9 H9x9;
+                       FixedBankSoAMap<9, SharedLanePitch> H9x9(
+                           shared_h + threadIdx.x);
                        AOP::ddEddq(H9x9, kappa, q);
-                       make_spd(H9x9);
 
-                       H.block<9, 9>(3, 3) = H9x9 * Vdt2;
+                       Matrix12x12 H = Matrix12x12::Zero();
+                       auto H9x9_projected = H.block<9, 9>(3, 3);
+                       make_spd_fixed_bank_shared_upper_fma<9>(
+                           H9x9, H9x9_projected);
+                       H9x9_projected *= Vdt2;
                        body_hessian(i)     = H;
-                   });
+                   };
+
+        using GradientHessianCallable =
+            std::decay_t<decltype(gradient_hessian_kernel)>;
+        static const cudaError_t preferred_carveout_status =
+            cudaFuncSetAttribute(
+                reinterpret_cast<const void*>(
+                    muda::details::parallel_for_kernel<
+                        GradientHessianCallable,
+                        muda::Default>),
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                32);
+        checkCudaErrors(preferred_carveout_status);
+
+        ParallelFor(16)
+            .file_line(__FILE__, __LINE__)
+            .apply(N, std::move(gradient_hessian_kernel));
     }
 };
 
