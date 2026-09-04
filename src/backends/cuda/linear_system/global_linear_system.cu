@@ -537,6 +537,28 @@ void GlobalLinearSystem::Impl::spmv_dot(cuda_tool::CDenseVectorView<Float> x,
                             stream);
 }
 
+void GlobalLinearSystem::Impl::spmv_dot_pipelined(
+    cuda_tool::CDenseVectorView<Float> x,
+    cuda_tool::DenseVectorView<Float>  y,
+    cuda_tool::VarView<Float>          d_dot,
+    cuda_tool::DenseVectorView<Float>  next_y,
+    cuda_tool::VarView<Float>          next_dot,
+    cuda_tool::CVarView<IndexT>        converged,
+    cudaStream_t                       stream)
+{
+    spmver.rbk_sym_spmv_dot_pipelined(1.0,
+                                      bcoo_A.cview(),
+                                      x,
+                                      y,
+                                      d_dot,
+                                      next_y,
+                                      next_dot,
+                                      converged,
+                                      triplet_count_dev.cviewer(),
+                                      bcoo_A.triplet_capacity(),
+                                      stream);
+}
+
 bool GlobalLinearSystem::Impl::accuracy_statisfied(cuda_tool::DenseVectorView<Float> r)
 {
     auto diag_dof_counts  = diag_dof_offsets_counts.counts();

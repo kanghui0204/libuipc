@@ -244,6 +244,16 @@ void LinearFusedPCG::do_solve(GlobalLinearSystem::SolvingInfo& info)
     p.resize(N);
     Ap.resize(N);
 
+    if(m_graph_mode != 0)
+    {
+        for(auto& graph_Ap : m_graph_Ap)
+        {
+            if(graph_Ap.capacity() < N)
+                graph_Ap.reserve(reserve_ratio * N);
+            graph_Ap.resize(N);
+        }
+    }
+
     auto iter = fused_pcg(x, b, max_iter_ratio * b.size());
 
     info.iter_count(iter);
@@ -414,6 +424,41 @@ void LinearFusedPCG::run_iteration(cuda_tool::DenseVectorView<Float> x, cudaStre
     fused_swap_rz(d_rz_new.view(), d_rz.view(), d_converged.view(), stream);
 }
 
+void LinearFusedPCG::run_graph_iteration(cuda_tool::DenseVectorView<Float> x,
+                                         SizeT                              slot,
+                                         cudaStream_t                       stream)
+{
+    const SizeT next_slot = slot ^ SizeT{1};
+
+    // Ap = A * p and pAp = p^T * Ap. The same CTA256 kernel clears the
+    // opposite slot for its next use and skips the full sparse traversal once
+    // an earlier iteration in this replay block converges.
+    spmv_dot_pipelined(p.cview(),
+                       m_graph_Ap[slot].view(),
+                       m_graph_pAp[slot].view(),
+                       m_graph_Ap[next_slot].view(),
+                       m_graph_pAp[next_slot].view(),
+                       d_converged.view(),
+                       stream);
+
+    fused_update_xr(d_rz.view(),
+                    m_graph_pAp[slot].view(),
+                    d_converged.view(),
+                    x,
+                    p.cview(),
+                    r.view(),
+                    m_graph_Ap[slot].cview(),
+                    stream);
+
+    apply_preconditioner(z, r, d_converged.view(), stream);
+    fused_dot(r.cview(), z.cview(), d_rz_new.view(), stream);
+    fused_update_converged(
+        d_rz_new.view(), d_converged.view(), d_rz_tol.view(), stream);
+    fused_update_p(
+        d_rz_new.view(), d_rz.view(), d_converged.view(), p.view(), z.cview(), stream);
+    fused_swap_rz(d_rz_new.view(), d_rz.view(), d_converged.view(), stream);
+}
+
 // ---------------------------------------------------------------------------
 // CUDA graph block replay
 // ---------------------------------------------------------------------------
@@ -521,18 +566,22 @@ bool LinearFusedPCG::graph_key_matches(cuda_tool::DenseVectorView<Float>  x,
     if(!m_graph.ready())
         return false;
     auto                        A    = matrix_data_ptrs();
-    std::array<const void*, 12> ptrs = {x.data(),
+    std::array<const void*, 16> ptrs = {x.data(),
                                         b.data(),
                                         r.buffer_view().data(),
                                         z.buffer_view().data(),
                                         p.buffer_view().data(),
                                         Ap.buffer_view().data(),
+                                        m_graph_Ap[0].buffer_view().data(),
+                                        m_graph_Ap[1].buffer_view().data(),
                                         A[0],
                                         A[1],
                                         A[2],
                                         d_rz.data(),
                                         d_rz_new.data(),
-                                        d_pAp.data()};
+                                        d_pAp.data(),
+                                        m_graph_pAp[0].data(),
+                                        m_graph_pAp[1].data()};
     return m_graph_n == x.size() && m_graph_interval == interval
            && m_graph_max_iter == max_iter && m_graph_ptrs == ptrs;
 }
@@ -548,8 +597,15 @@ void LinearFusedPCG::rebuild_graph(cuda_tool::DenseVectorView<Float>  x,
     auto result = m_graph.capture(
         [&](cudaStream_t capture_stream)
         {
+            // Every replay starts at slot 0. This prefix keeps odd intervals
+            // correct; for the fixed production interval 50 it is a cheap
+            // once-per-block redundant clear, not a per-iteration node.
+            cuda_tool::BufferLaunch(capture_stream)
+                .fill<Float>(m_graph_Ap[0].buffer_view(), 0);
+            CUDA_TOOL_CHECK(cudaMemsetAsync(
+                m_graph_pAp[0].data(), 0, sizeof(Float), capture_stream));
             for(SizeT i = 0; i < interval; ++i)
-                run_iteration(x, capture_stream, false);
+                run_graph_iteration(x, i & SizeT{1}, capture_stream);
         });
 
     if(result != cuda_tool::GraphCapture::Result::Ok)
@@ -574,12 +630,16 @@ void LinearFusedPCG::rebuild_graph(cuda_tool::DenseVectorView<Float>  x,
                         z.buffer_view().data(),
                         p.buffer_view().data(),
                         Ap.buffer_view().data(),
+                        m_graph_Ap[0].buffer_view().data(),
+                        m_graph_Ap[1].buffer_view().data(),
                         A[0],
                         A[1],
                         A[2],
                         d_rz.data(),
                         d_rz_new.data(),
-                        d_pAp.data()};
+                        d_pAp.data(),
+                        m_graph_pAp[0].data(),
+                        m_graph_pAp[1].data()};
     m_graph_n        = x.size();
     m_graph_interval = interval;
     m_graph_max_iter = max_iter;

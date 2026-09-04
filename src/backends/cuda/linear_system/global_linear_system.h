@@ -334,6 +334,13 @@ class GlobalLinearSystem : public SimSystem
                       cuda_tool::DenseVectorView<Float>  y,
                       cuda_tool::VarView<Float>          d_dot,
                       cudaStream_t                       stream = nullptr);
+        void spmv_dot_pipelined(cuda_tool::CDenseVectorView<Float> x,
+                                cuda_tool::DenseVectorView<Float>  y,
+                                cuda_tool::VarView<Float>          d_dot,
+                                cuda_tool::DenseVectorView<Float>  next_y,
+                                cuda_tool::VarView<Float>          next_dot,
+                                cuda_tool::CVarView<IndexT>        converged,
+                                cudaStream_t                       stream);
 
         // data pointers of the assembled matrix buffers (row/col/value),
         // for the FusedPCG CUDA-graph validity key: a reassembly that
