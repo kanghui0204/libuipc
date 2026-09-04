@@ -454,6 +454,7 @@ namespace
         cuda_tool::BufferView<int>                    _int_lc,
         cuda_tool::BufferView<uint32_t>               _int_mark,
         cuda_tool::BufferView<int>                    _int_range_y,
+        cuda_tool::BufferView<int>                    _self_max_rank,
         cuda_tool::BufferView<AABB>                   _int_box,
         cuda_tool::BufferView<IndexT>                 _int_bid,
         cuda_tool::BufferView<IndexT>                 _int_cid,
@@ -485,6 +486,7 @@ namespace
         InfoStacklessBVH::Node n;
         int                    new_id = _tk_map(idx);
         uint32_t               m      = _int_mark(idx);
+        _self_max_rank(new_id)        = _int_range_y(idx);
         n.lc    = (m & 1) ? _int_lc(idx) + int_size : _tk_map(_int_lc(idx));
         n.bound = _int_box(idx);
         int ie  = _lvs_lca(_int_range_y(idx) + 1);
@@ -509,6 +511,7 @@ namespace
         int                                           numObjs,
         cuda_tool::BufferView<int>                    _lvs_idx,
         cuda_tool::BufferView<InfoStacklessBVH::Node> _nodes,
+        cuda_tool::BufferView<int>                    _self_max_rank,
         cuda_tool::CBufferView<IndexT>                _bids,
         cuda_tool::CBufferView<IndexT>                _cids,
         bool                                          has_info,
@@ -564,6 +567,14 @@ namespace
                 {
                     if(st == -1)
                         break;
+                    // Self traversal only accepts leaves with Morton rank > tid.
+                    // An internal subtree whose maximum rank cannot pass that
+                    // gate is the duplicate half and can be skipped wholesale.
+                    if(st < intSize && _self_max_rank(st) <= tid)
+                    {
+                        st = _nodes(st).escape;
+                        continue;
+                    }
                     auto node = _nodes(st);
                     if(!node.bound.intersects(bv))
                     {
@@ -861,6 +872,7 @@ inline void InfoStacklessBVH::Impl::reorderNode(int int_size)
             int_lc.view(),
             int_mark.view(),
             int_range_y.view(),
+            self_max_rank.view(),
             int_aabb.view(),
             int_bid.view(),
             int_cid.view(),
@@ -877,11 +889,12 @@ inline void InfoStacklessBVH::Impl::build(cuda_tool::CBufferView<AABB>   aabbs,
     objs          = aabbs;
     bids          = _bids;
     cids          = _cids;
-    auto num_objs = aabbs.size();
+    auto num_objs     = aabbs.size();
+    auto num_internal = num_objs > 0 ? num_objs - 1 : 0;
+    self_max_rank.resize(num_internal);
     if(num_objs == 0)
         return;
 
-    auto num_internal = num_objs - 1;
     auto num_nodes    = num_objs * 2 - 1;
     mtcode.resize(num_objs);
     sorted_mtcode.resize(num_objs);
@@ -961,6 +974,7 @@ void InfoStacklessBVH::Impl::stacklessSelf(NodeCull                node_cull,
                                               num_objs,
                                               ext_idx.view(),
                                               nodes.view(),
+                                              self_max_rank.view(),
                                               bids,
                                               cids,
                                               has_info,
