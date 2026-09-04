@@ -3,7 +3,7 @@
 #include <time_integrator/time_integrator.h>
 #include <uipc/builtin/attribute_name.h>
 #include <finite_element/constitutions/stress_plastic_discrete_shell_bending_function.h>
-#include <utils/make_spd.h>
+#include <utils/fixed_bank_soa_evd.h>
 #include <utils/matrix_assembler.h>
 #include <utils/dump_utils.h>
 #include <algorithm>
@@ -123,8 +123,12 @@ namespace
         }
         else
         {
-            Vector12    G12;
-            Matrix12x12 H12x12;
+            constexpr int SharedLanePitch = 16;
+            __shared__ Float shared_h[12 * 12 * SharedLanePitch];
+
+            Vector12 G12;
+            FixedBankSoAMap<12, SharedLanePitch> H12x12(
+                shared_h + threadIdx.x);
             SPDSB::d2Edx2(G12,
                           H12x12,
                           x0,
@@ -142,9 +146,12 @@ namespace
             DVA.segment<StencilSize>(I * StencilSize).write(stencil, G12);
 
             H12x12 *= Vdt2;
-            make_spd(H12x12);
+            Vector12 eigen_values;
+            selfadjoint_evd_fixed_bank_shared<12>(H12x12, eigen_values);
             TripletMatrixAssembler TMA{H3x3s};
-            TMA.half_block<StencilSize>(I * HalfHessianSize).write(stencil, H12x12);
+            TMA.half_block<StencilSize>(I * HalfHessianSize)
+                .write_psd_from_eigendecomposition(
+                    stencil, H12x12, eigen_values);
         }
     }
 
@@ -433,7 +440,8 @@ class StressPlasticDiscreteShellBending final : public FiniteElementExtraConstit
         {
             auto k =
                 StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel<false>;
-            k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
+            constexpr int BlockSize = 16;
+            k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
                 stencils.view(),
                 bending_stiffnesses.view(),
                 theta_bars.view(),
