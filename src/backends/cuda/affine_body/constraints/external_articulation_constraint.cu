@@ -5,9 +5,9 @@
 #include <affine_body/constraints/external_articulation_constraint_function.h>
 #include <affine_body/utils.h>
 #include <algorithm/fast_segmental_reduce.h>
+#include <utils/fixed_bank_soa_evd.h>
 #include <utils/matrix_assembler.h>
 #include <utils/matrix_unpacker.h>
-#include <utils/make_spd.h>
 #include <time_integrator/time_integrator.h>
 #include <kernel_cout.h>
 
@@ -255,6 +255,9 @@ namespace
         int joint_joint_I = blockIdx.x * blockDim.x + threadIdx.x;
         if(joint_joint_I >= n)
             return;
+        constexpr int SharedLanePitch = 16;
+        __shared__ Float shared_h[12 * 12 * SharedLanePitch];
+
         Float    m_ij = joint_joint_id_to_mass(joint_joint_I);
         Vector2i ij   = joint_joint_id_to_joint_ij(joint_joint_I);
 
@@ -334,8 +337,11 @@ namespace
                 ERJ::F<Float>(F_t, basis_k, q_prevk, basis_l, q_prevl);
                 Matrix12x12 ddDeltaTheta_ddF;
                 ERJ::ddDeltaTheta_ddF(ddDeltaTheta_ddF, F, F_t);
-                Matrix12x12 HF = G_theta_i * ddDeltaTheta_ddF;
-                make_spd(HF);
+                FixedBankSoAMap<12, SharedLanePitch> HF_workspace(
+                    shared_h + threadIdx.x);
+                HF_workspace = G_theta_i * ddDeltaTheta_ddF;
+                Matrix12x12 HF;
+                make_spd_fixed_bank_shared_upper_fma<12>(HF_workspace, HF);
                 ERJ::JT_H_J(JT_H_J, HF, basis_k, basis_l, basis_k, basis_l);
             }
             else if(joint_uid == PrismaticUID)
@@ -344,8 +350,11 @@ namespace
                 EPJ::F<Float>(F_t, basis_k, q_prevk, basis_l, q_prevl);
                 Matrix12x12 ddDeltaTheta_ddF;
                 EPJ::ddDeltaTheta_ddF(ddDeltaTheta_ddF, F, F_t);
-                Matrix12x12 HF = G_theta_i * ddDeltaTheta_ddF;
-                make_spd(HF);
+                FixedBankSoAMap<12, SharedLanePitch> HF_workspace(
+                    shared_h + threadIdx.x);
+                HF_workspace = G_theta_i * ddDeltaTheta_ddF;
+                Matrix12x12 HF;
+                make_spd_fixed_bank_shared_upper_fma<12>(HF_workspace, HF);
                 EPJ::JT_H_J(JT_H_J, HF, basis_k, basis_l, basis_k, basis_l);
             }
             else
@@ -1062,7 +1071,8 @@ class ExternalArticulationConstraint final : public InterAffineBodyConstraint
         if(n_hessian > 0)
         {
             auto k = external_articulation_constraint_compute_gradient_hessian_k2_kernel;
-            k<<<cuda_tool::best_grid_dim(n_hessian, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
+            constexpr int BlockSize = 16;
+            k<<<(n_hessian + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
                 info.hessians(),
                 joint_id_to_G_theta.cview(),
                 joint_id_to_body_ids.cview(),
