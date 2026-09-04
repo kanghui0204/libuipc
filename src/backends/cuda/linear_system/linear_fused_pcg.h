@@ -43,6 +43,9 @@ class LinearFusedPCG : public IterativeSolver
     // One iteration of the PCG loop body on `stream` (the unit of graph
     // capture and of the uncaptured fallback path).
     void run_iteration(cuda_tool::DenseVectorView<Float> x, cudaStream_t stream, bool timed);
+    void run_graph_iteration(cuda_tool::DenseVectorView<Float> x,
+                             SizeT                              slot,
+                             cudaStream_t                       stream);
 
     // Capture `interval` iterations into m_graph (no execution during
     // capture); on any failure disable graph replay for this instance.
@@ -60,6 +63,12 @@ class LinearFusedPCG : public IterativeSolver
     DeviceDenseVector z;
     DeviceDenseVector p;
     DeviceDenseVector Ap;
+
+    // Block-replay only. The active SpMV clears the opposite slot in-kernel,
+    // removing the per-iteration Ap/pAp clear nodes without changing the
+    // legacy plain or conditional-graph paths.
+    std::array<DeviceDenseVector, 2>      m_graph_Ap;
+    std::array<cuda_tool::DeviceVar<Float>, 2> m_graph_pAp;
 
     cuda_tool::DeviceVar<Float>  d_rz;
     cuda_tool::DeviceVar<Float>  d_pAp;
@@ -79,7 +88,7 @@ class LinearFusedPCG : public IterativeSolver
     IndexT                  m_graph_mode = 0;
     cuda_tool::GraphCapture m_graph;
     // validity key: every device pointer baked into the captured kernels
-    std::array<const void*, 12> m_graph_ptrs{};
+    std::array<const void*, 16> m_graph_ptrs{};
     SizeT                       m_graph_n        = 0;
     SizeT                       m_graph_interval = 0;
     SizeT                       m_graph_max_iter = 0;

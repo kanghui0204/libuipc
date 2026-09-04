@@ -342,13 +342,37 @@ namespace
         }
     }
 
-    __global__ void Spmv_rbk_sym_spmv_dot_kernel(Float a,
-                                                 cuda_tool::CBCOOMatrixView<Float, 3> A,
-                                                 cuda_tool::CDenseVectorView<Float> x,
-                                                 cuda_tool::DenseVectorView<Float> y,
-                                                 cuda_tool::Dense<Float> d_dot,
-                                                 cuda_tool::CDense<IndexT> d_triplet_count)
+    template <bool Pipelined>
+    __global__ void Spmv_rbk_sym_spmv_dot_kernel(
+        Float                                a,
+        cuda_tool::CBCOOMatrixView<Float, 3> A,
+        cuda_tool::CDenseVectorView<Float>   x,
+        cuda_tool::DenseVectorView<Float>    y,
+        cuda_tool::Dense<Float>              d_dot,
+        cuda_tool::CDense<IndexT>            d_triplet_count,
+        Float*                               next_y,
+        int                                  next_y_size,
+        Float*                               next_dot,
+        const IndexT*                        converged)
     {
+        auto global_thread_id   = blockDim.x * blockIdx.x + threadIdx.x;
+        auto thread_id_in_block = threadIdx.x;
+
+        if constexpr(Pipelined)
+        {
+            // Every thread observes the same stream-ordered scalar. Returning
+            // here is therefore uniform across the block and cannot strand a
+            // later collective.
+            if(*converged != 0)
+                return;
+
+            for(int i = global_thread_id; i < next_y_size;
+                i += gridDim.x * blockDim.x)
+                next_y[i] = Float{0};
+            if(global_thread_id == 0)
+                *next_dot = Float{0};
+        }
+
         // count lives on device: a graph capturing this kernel then stays
         // valid when the matrix nnz changes within the reserved capacity
         const int     triplet_count = (int)(*d_triplet_count);
@@ -360,8 +384,6 @@ namespace
         using WarpReduceInt   = cub::WarpReduce<int, warp_size>;
         using WarpReduceFloat = cub::WarpReduce<Float, warp_size>;
 
-        auto global_thread_id   = blockDim.x * blockIdx.x + threadIdx.x;
-        auto thread_id_in_block = threadIdx.x;
         auto warp_id            = thread_id_in_block / warp_size;
         auto lane_id            = thread_id_in_block & (warp_size - 1);
 
@@ -585,8 +607,53 @@ void Spmv::rbk_sym_spmv_dot(Float                                a,
 
     if(block_count > 0)
     {
-        Spmv_rbk_sym_spmv_dot_kernel<<<block_count, block_dim, 0, stream>>>(
-            a, A, x, y, d_dot.viewer(), d_triplet_count);
+        Spmv_rbk_sym_spmv_dot_kernel<false><<<block_count, block_dim, 0, stream>>>(
+            a,
+            A,
+            x,
+            y,
+            d_dot.viewer(),
+            d_triplet_count,
+            nullptr,
+            0,
+            nullptr,
+            nullptr);
+    }
+}
+
+void Spmv::rbk_sym_spmv_dot_pipelined(
+    Float                                a,
+    cuda_tool::CBCOOMatrixView<Float, 3> A,
+    cuda_tool::CDenseVectorView<Float>   x,
+    cuda_tool::DenseVectorView<Float>    y,
+    cuda_tool::VarView<Float>            d_dot,
+    cuda_tool::DenseVectorView<Float>    next_y,
+    cuda_tool::VarView<Float>            next_dot,
+    cuda_tool::CVarView<IndexT>          converged,
+    cuda_tool::CDense<IndexT>            d_triplet_count,
+    SizeT                                triplet_capacity,
+    cudaStream_t                         stream)
+{
+    constexpr int block_dim = 256;
+    int block_count = (int)((triplet_capacity + block_dim - 1) / block_dim);
+
+    // Keep the clear contract valid for an empty-capacity matrix as well.
+    if(block_count == 0 && next_y.size() != 0)
+        block_count = 1;
+
+    if(block_count > 0)
+    {
+        Spmv_rbk_sym_spmv_dot_kernel<true><<<block_count, block_dim, 0, stream>>>(
+            a,
+            A,
+            x,
+            y,
+            d_dot.viewer(),
+            d_triplet_count,
+            next_y.data(),
+            (int)next_y.size(),
+            next_dot.data(),
+            converged.data());
     }
 }
 

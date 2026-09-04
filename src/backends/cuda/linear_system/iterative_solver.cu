@@ -35,6 +35,19 @@ void IterativeSolver::spmv_dot(cuda_tool::CDenseVectorView<Float> x,
     m_system->m_impl.spmv_dot(x, y, d_dot, stream);
 }
 
+void IterativeSolver::spmv_dot_pipelined(
+    cuda_tool::CDenseVectorView<Float> x,
+    cuda_tool::DenseVectorView<Float>  y,
+    cuda_tool::VarView<Float>          d_dot,
+    cuda_tool::DenseVectorView<Float>  next_y,
+    cuda_tool::VarView<Float>          next_dot,
+    cuda_tool::CVarView<IndexT>        converged,
+    cudaStream_t                       stream)
+{
+    m_system->m_impl.spmv_dot_pipelined(
+        x, y, d_dot, next_y, next_dot, converged, stream);
+}
+
 void IterativeSolver::apply_preconditioner(cuda_tool::DenseVectorView<Float>  z,
                                            cuda_tool::CDenseVectorView<Float> r,
                                            cuda_tool::CVarView<IndexT> converged,

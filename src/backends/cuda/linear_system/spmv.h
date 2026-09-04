@@ -46,6 +46,22 @@ class Spmv
                           SizeT                                triplet_capacity,
                           cudaStream_t stream = nullptr);
 
+    // Graph-only ping-pong variant. `y` and `d_dot` must already be zero;
+    // while producing them, the same kernel clears the buffers consumed by
+    // the next iteration. A converged block becomes a uniform no-op.
+    void rbk_sym_spmv_dot_pipelined(
+        Float                                a,
+        cuda_tool::CBCOOMatrixView<Float, 3> A,
+        cuda_tool::CDenseVectorView<Float>   x,
+        cuda_tool::DenseVectorView<Float>    y,
+        cuda_tool::VarView<Float>            d_dot,
+        cuda_tool::DenseVectorView<Float>    next_y,
+        cuda_tool::VarView<Float>            next_dot,
+        cuda_tool::CVarView<IndexT>          converged,
+        cuda_tool::CDense<IndexT>            d_triplet_count,
+        SizeT                                triplet_capacity,
+        cudaStream_t                         stream);
+
     // debug fallback cpu spmv
     // very slow, only for debug
     void cpu_sym_spmv(Float                                a,
