@@ -225,7 +225,11 @@ class NeoHookeanShell2D final : public Codim2DConstitution
         int  n = (int)info.indices().size();
         if(n > 0)
         {
-            k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
+            constexpr int energy_threads = 128;
+            k<<<(n + energy_threads - 1) / energy_threads,
+                 energy_threads,
+                 0,
+                 nullptr>>>(
                 lambdas.cview(),
                 mus.cview(),
                 info.rest_areas(),
