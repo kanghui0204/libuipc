@@ -50,12 +50,13 @@ void GlobalTrajectoryFilter::Impl::init()
     h_tois.resize(filter_view.size());
 }
 
-void GlobalTrajectoryFilter::detect(Float alpha)
+void GlobalTrajectoryFilter::detect(Float alpha, bool reuse_bvh_topology)
 {
     for(auto filter : m_impl.filters.view())
     {
         DetectInfo info;
-        info.m_alpha = alpha;
+        info.m_alpha              = alpha;
+        info.m_reuse_bvh_topology = reuse_bvh_topology;
         filter->detect(info);
     }
 }

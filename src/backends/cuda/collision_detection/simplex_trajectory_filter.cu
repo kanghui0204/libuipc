@@ -85,7 +85,8 @@ void SimplexTrajectoryFilter::do_build()
 void SimplexTrajectoryFilter::do_detect(GlobalTrajectoryFilter::DetectInfo& info)
 {
     DetectInfo this_info{&m_impl};
-    this_info.m_alpha = info.alpha();
+    this_info.m_alpha              = info.alpha();
+    this_info.m_reuse_bvh_topology = info.reuse_bvh_topology();
     do_detect(this_info);
 }
 

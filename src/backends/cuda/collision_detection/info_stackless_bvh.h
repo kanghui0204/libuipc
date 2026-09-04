@@ -119,6 +119,13 @@ class InfoStacklessBVH
                cuda_tool::CBufferView<IndexT> CIDs);
     void build(cuda_tool::CBufferView<AABB> aabbs);
 
+    // Reuse the existing Morton topology while updating bounds and informative
+    // metadata. A false result leaves the tree untouched so callers can fall
+    // back to a full build when the primitive count or cache is incompatible.
+    bool refit(cuda_tool::CBufferView<AABB>   aabbs,
+               cuda_tool::CBufferView<IndexT> BIDs,
+               cuda_tool::CBufferView<IndexT> CIDs);
+
     template <typename NodePred, typename LeafPred>
     void detect(cuda_tool::CBuffer2DView<IndexT> cmts, NodePred np, LeafPred lp, QueryBuffer& qbuffer);
 
@@ -174,6 +181,9 @@ class InfoStacklessBVH
         void        build(cuda_tool::CBufferView<AABB>   aabbs,
                           cuda_tool::CBufferView<IndexT> bids,
                           cuda_tool::CBufferView<IndexT> cids);
+        bool        refit(cuda_tool::CBufferView<AABB>   aabbs,
+                          cuda_tool::CBufferView<IndexT> bids,
+                          cuda_tool::CBufferView<IndexT> cids);
 
         // Pre-loads query bid/cid into shared memory before the traversal loop.
         // node_cull receives NodePredInfo with query_bid/query_cid from SMem.
@@ -220,6 +230,11 @@ class InfoStacklessBVH
         // Maximum Morton-sorted leaf rank for each reordered internal node.
         // stacklessSelf uses it to skip the already-covered half-tree.
         cuda_tool::DeviceVector<int>      self_max_rank;
+        // Stable reordered-tree links and per-refit publication state. The
+        // last arriving child publishes each parent before walking upward.
+        cuda_tool::DeviceVector<int>      refit_parent;
+        cuda_tool::DeviceVector<int>      refit_right_child;
+        cuda_tool::DeviceVector<int>      refit_arrivals;
         cuda_tool::DeviceVector<uint32_t> int_mark;
         cuda_tool::DeviceVector<AABB>     int_aabb;
         cuda_tool::DeviceVector<IndexT>   ext_bid;
