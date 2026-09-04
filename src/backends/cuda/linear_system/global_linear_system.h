@@ -205,6 +205,40 @@ class GlobalLinearSystem : public SimSystem
         Impl*                       m_impl   = nullptr;
     };
 
+    class FusedPcgUpdateApplyDotInfo
+    {
+      public:
+        FusedPcgUpdateApplyDotInfo(Impl* impl) noexcept
+            : m_impl(impl)
+        {
+        }
+
+        DenseVectorView              x() const { return m_x; }
+        CDenseVectorView             p() const { return m_p; }
+        DenseVectorView              r() const { return m_r; }
+        CDenseVectorView             Ap() const { return m_Ap; }
+        DenseVectorView              z() const { return m_z; }
+        cuda_tool::CVarView<Float>   rz() const { return m_rz; }
+        cuda_tool::CVarView<Float>   pAp() const { return m_pAp; }
+        cuda_tool::VarView<Float>    rz_new() const { return m_rz_new; }
+        cuda_tool::CVarView<IndexT>  converged() const { return m_converged; }
+        cudaStream_t                 stream() const noexcept { return m_stream; }
+
+      private:
+        friend class Impl;
+        DenseVectorView             m_x;
+        CDenseVectorView            m_p;
+        DenseVectorView             m_r;
+        CDenseVectorView            m_Ap;
+        DenseVectorView             m_z;
+        cuda_tool::CVarView<Float>  m_rz;
+        cuda_tool::CVarView<Float>  m_pAp;
+        cuda_tool::VarView<Float>   m_rz_new;
+        cuda_tool::CVarView<IndexT> m_converged;
+        cudaStream_t                m_stream = nullptr;
+        Impl*                       m_impl   = nullptr;
+    };
+
     class AccuracyInfo
     {
       public:
@@ -325,6 +359,17 @@ class GlobalLinearSystem : public SimSystem
                                   cuda_tool::CDenseVectorView<Float> r,
                                   cuda_tool::CVarView<IndexT>        converged,
                                   cudaStream_t stream = nullptr);
+        bool fused_pcg_update_apply_dot(
+            cuda_tool::DenseVectorView<Float>  x,
+            cuda_tool::CDenseVectorView<Float> p,
+            cuda_tool::DenseVectorView<Float>  r,
+            cuda_tool::CDenseVectorView<Float> Ap,
+            cuda_tool::DenseVectorView<Float>  z,
+            cuda_tool::CVarView<Float>         rz,
+            cuda_tool::CVarView<Float>         pAp,
+            cuda_tool::VarView<Float>          rz_new,
+            cuda_tool::CVarView<IndexT>        converged,
+            cudaStream_t                       stream);
 
         void spmv(Float                              a,
                   cuda_tool::CDenseVectorView<Float> x,

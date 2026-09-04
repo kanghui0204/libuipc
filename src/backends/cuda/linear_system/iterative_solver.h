@@ -41,6 +41,17 @@ class IterativeSolver : public SimSystem
                             cuda_tool::VarView<Float>          next_dot,
                             cuda_tool::CVarView<IndexT>        converged,
                             cudaStream_t                       stream);
+    bool fused_pcg_update_apply_dot(
+        cuda_tool::DenseVectorView<Float>  x,
+        cuda_tool::CDenseVectorView<Float> p,
+        cuda_tool::DenseVectorView<Float>  r,
+        cuda_tool::CDenseVectorView<Float> Ap,
+        cuda_tool::DenseVectorView<Float>  z,
+        cuda_tool::CVarView<Float>         rz,
+        cuda_tool::CVarView<Float>         pAp,
+        cuda_tool::VarView<Float>          rz_new,
+        cuda_tool::CVarView<IndexT>        converged,
+        cudaStream_t                       stream);
     void apply_preconditioner(cuda_tool::DenseVectorView<Float>  z,
                               cuda_tool::CDenseVectorView<Float> r,
                               cuda_tool::CVarView<IndexT>        converged,

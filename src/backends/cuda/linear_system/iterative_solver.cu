@@ -48,6 +48,22 @@ void IterativeSolver::spmv_dot_pipelined(
         x, y, d_dot, next_y, next_dot, converged, stream);
 }
 
+bool IterativeSolver::fused_pcg_update_apply_dot(
+    cuda_tool::DenseVectorView<Float>  x,
+    cuda_tool::CDenseVectorView<Float> p,
+    cuda_tool::DenseVectorView<Float>  r,
+    cuda_tool::CDenseVectorView<Float> Ap,
+    cuda_tool::DenseVectorView<Float>  z,
+    cuda_tool::CVarView<Float>         rz,
+    cuda_tool::CVarView<Float>         pAp,
+    cuda_tool::VarView<Float>          rz_new,
+    cuda_tool::CVarView<IndexT>        converged,
+    cudaStream_t                       stream)
+{
+    return m_system->m_impl.fused_pcg_update_apply_dot(
+        x, p, r, Ap, z, rz, pAp, rz_new, converged, stream);
+}
+
 void IterativeSolver::apply_preconditioner(cuda_tool::DenseVectorView<Float>  z,
                                            cuda_tool::CDenseVectorView<Float> r,
                                            cuda_tool::CVarView<IndexT> converged,
