@@ -356,6 +356,53 @@ class TripletMatrixAssembler
             }
         }
 
+        // Reconstruct one PSD block at a time from V*diag(lambda)*V^T and
+        // immediately write it. This keeps the eigenvectors intact while
+        // avoiding a second full local/shared Hessian.
+        template <typename Eigenvectors, typename Eigenvalues>
+        UIPC_GENERIC void write_psd_from_eigendecomposition(
+            const Eigen::Vector<IndexT, N>& indices,
+            const Eigenvectors&             eigenvectors,
+            const Eigenvalues&              eigenvalues,
+            T                               post_scale = T(1))
+        {
+            static_assert(Eigenvectors::RowsAtCompileTime == N * BlockDim);
+            static_assert(Eigenvectors::ColsAtCompileTime == N * BlockDim);
+            static_assert(Eigenvalues::RowsAtCompileTime == N * BlockDim);
+
+            IndexT offset = m_I;
+            for(IndexT ii = 0; ii < N; ++ii)
+            {
+                for(IndexT jj = ii; jj < N; ++jj)
+                {
+                    auto [L, R] = upper_LR(indices, ii, jj);
+                    ElementMatrix H;
+#pragma unroll
+                    for(int row = 0; row < BlockDim; ++row)
+                    {
+#pragma unroll
+                        for(int col = 0; col < BlockDim; ++col)
+                        {
+                            T value = T(0);
+#pragma unroll
+                            for(int k = 0; k < N * BlockDim; ++k)
+                            {
+                                const T weighted_col =
+                                    eigenvalues(k)
+                                    * eigenvectors(R * BlockDim + col, k);
+                                value = fma(eigenvectors(L * BlockDim + row, k),
+                                            weighted_col,
+                                            value);
+                            }
+                            H(row, col) = value * post_scale;
+                        }
+                    }
+                    m_assembler.m_triplet(offset++).write(
+                        indices(L), indices(R), H);
+                }
+            }
+        }
+
         /**
          * @brief Only write to the upper triangular part of the global matrix. (not the submatrix)
          */
