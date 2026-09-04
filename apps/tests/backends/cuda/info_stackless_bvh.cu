@@ -478,6 +478,154 @@ void run_self_rank_reordered_node_case()
     check_cp_exact(std::move(actual), std::move(expected));
 }
 
+std::vector<AABB> make_all_overlapping_aabbs(size_t count)
+{
+    std::vector<AABB> aabbs(count);
+    for(size_t i = 0; i < count; ++i)
+    {
+        const float shift = static_cast<float>(i) * 1.0e-4f;
+        aabbs[i].extend(Vector3{shift, shift, shift}.cast<float>());
+        aabbs[i].extend(Vector3{1.0 + shift, 1.0 + shift, 1.0 + shift}.cast<float>());
+    }
+    return aabbs;
+}
+
+std::vector<Vector2i> run_self_all_pairs(const std::vector<AABB>& aabbs,
+                                         bool&                    retried)
+{
+    std::vector<IndexT>  bids(aabbs.size(), 0);
+    std::vector<IndexT>  cids(aabbs.size(), 0);
+    DeviceBuffer<AABB>   d_aabbs(aabbs.size());
+    DeviceBuffer<IndexT> d_bids(bids.size());
+    DeviceBuffer<IndexT> d_cids(cids.size());
+    if(!aabbs.empty())
+    {
+        d_aabbs.view().copy_from(aabbs.data());
+        d_bids.view().copy_from(bids.data());
+        d_cids.view().copy_from(cids.data());
+    }
+
+    DeviceBuffer2D<IndexT> d_cmts(Extent2D{1, 1});
+    IndexT                  allow = 1;
+    d_cmts.view().copy_from(&allow);
+
+    InfoStacklessBVH bvh;
+    bvh.build(d_aabbs.view(), d_bids.view(), d_cids.view());
+    InfoStacklessBVH::QueryBuffer qbuffer;
+    qbuffer.m_pairs.release();
+    qbuffer.reserve(1);
+    bvh.launch_detect(d_cmts.view(), NodePred{}, LeafPredTrue{}, qbuffer);
+    int count = qbuffer.m_cpNum;
+    retried   = bvh.prepare_query_result(qbuffer, count);
+    if(retried)
+        bvh.launch_detect(d_cmts.view(), NodePred{}, LeafPredTrue{}, qbuffer);
+
+    std::vector<Vector2i> pairs(qbuffer.size());
+    if(!pairs.empty())
+        qbuffer.view().copy_to(pairs.data());
+    return pairs;
+}
+
+std::vector<Vector2i> run_other_all_pairs(const std::vector<AABB>& query_aabbs,
+                                          const std::vector<AABB>& tree_aabbs,
+                                          bool&                    retried)
+{
+    std::vector<IndexT> query_bids(query_aabbs.size(), 0);
+    std::vector<IndexT> query_cids(query_aabbs.size(), 0);
+    std::vector<IndexT> tree_bids(tree_aabbs.size(), 0);
+    std::vector<IndexT> tree_cids(tree_aabbs.size(), 0);
+
+    DeviceBuffer<AABB>   d_query_aabbs(query_aabbs.size());
+    DeviceBuffer<IndexT> d_query_bids(query_bids.size());
+    DeviceBuffer<IndexT> d_query_cids(query_cids.size());
+    if(!query_aabbs.empty())
+    {
+        d_query_aabbs.view().copy_from(query_aabbs.data());
+        d_query_bids.view().copy_from(query_bids.data());
+        d_query_cids.view().copy_from(query_cids.data());
+    }
+
+    DeviceBuffer<AABB>   d_tree_aabbs(tree_aabbs.size());
+    DeviceBuffer<IndexT> d_tree_bids(tree_bids.size());
+    DeviceBuffer<IndexT> d_tree_cids(tree_cids.size());
+    d_tree_aabbs.view().copy_from(tree_aabbs.data());
+    d_tree_bids.view().copy_from(tree_bids.data());
+    d_tree_cids.view().copy_from(tree_cids.data());
+
+    DeviceBuffer2D<IndexT> d_cmts(Extent2D{1, 1});
+    IndexT                  allow = 1;
+    d_cmts.view().copy_from(&allow);
+
+    InfoStacklessBVH bvh;
+    bvh.build(d_tree_aabbs.view(), d_tree_bids.view(), d_tree_cids.view());
+    InfoStacklessBVH::QueryBuffer qbuffer;
+    qbuffer.m_pairs.release();
+    qbuffer.reserve(1);
+    bvh.launch_query(d_query_aabbs.view(),
+                     d_query_bids.view(),
+                     d_query_cids.view(),
+                     d_cmts.view(),
+                     NodePred{},
+                     LeafPredTrue{},
+                     qbuffer,
+                     true);
+    int count = qbuffer.m_cpNum;
+    retried   = bvh.prepare_query_result(qbuffer, count);
+    if(retried)
+        bvh.launch_query(d_query_aabbs.view(),
+                         d_query_bids.view(),
+                         d_query_cids.view(),
+                         d_cmts.view(),
+                         NodePred{},
+                         LeafPredTrue{},
+                         qbuffer,
+                         false);
+
+    std::vector<Vector2i> pairs(qbuffer.size());
+    if(!pairs.empty())
+        qbuffer.view().copy_to(pairs.data());
+    return pairs;
+}
+
+void run_cta_queue_boundary_cases()
+{
+    constexpr std::array<size_t, 14> counts = {
+        0, 1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257};
+
+    for(size_t count : counts)
+    {
+        DYNAMIC_SECTION("Self N=" << count)
+        {
+            auto aabbs = make_all_overlapping_aabbs(count);
+            std::vector<Vector2i> expected;
+            for(IndexT i = 0; i < static_cast<IndexT>(count); ++i)
+                for(IndexT j = i + 1; j < static_cast<IndexT>(count); ++j)
+                    expected.emplace_back(i, j);
+            bool retried = false;
+            auto actual  = run_self_all_pairs(aabbs, retried);
+            CHECK(retried == (expected.size() > 1));
+            check_cp_exact(std::move(actual), std::move(expected));
+        }
+    }
+
+    const auto tree_aabbs = make_all_overlapping_aabbs(65);
+    for(size_t count : counts)
+    {
+        DYNAMIC_SECTION("Other N=" << count)
+        {
+            auto query_aabbs = make_all_overlapping_aabbs(count);
+            std::vector<Vector2i> expected;
+            for(IndexT i = 0; i < static_cast<IndexT>(count); ++i)
+                for(IndexT j = 0; j < static_cast<IndexT>(tree_aabbs.size()); ++j)
+                    expected.emplace_back(i, j);
+            bool retried = false;
+            auto actual = run_other_all_pairs(query_aabbs, tree_aabbs, retried);
+            CHECK(retried == (expected.size() > 1));
+            check_cp_exact(std::move(actual), std::move(expected));
+        }
+    }
+}
+
 void run_internal_cull_rate_case()
 {
     constexpr IndexT    n = 96;
@@ -767,4 +915,16 @@ TEST_CASE("info_stackless_bvh self Morton-rank pruning",
     using namespace test_info_stackless_bvh;
     run_internal_cull_proof_case();
     run_self_rank_reordered_node_case();
+}
+
+TEST_CASE("info_stackless_bvh CTA and queue boundaries",
+          "[collision detection][bvh_cta_sweep]")
+{
+    using namespace test_info_stackless_bvh;
+    fmt::println("Self CTA={} queue={}; Other CTA={} queue={}",
+                 uipc::info_stackless_detail::K_SELF_THREADS,
+                 uipc::info_stackless_detail::K_SELF_MAX_RES_PER_BLOCK,
+                 uipc::info_stackless_detail::K_OTHER_THREADS,
+                 uipc::info_stackless_detail::K_OTHER_MAX_RES_PER_BLOCK);
+    run_cta_queue_boundary_cases();
 }
