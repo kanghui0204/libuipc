@@ -94,7 +94,7 @@ class InfoStacklessBVH
         cuda_tool::DeviceBuffer<int>          m_querySortedId;
         cuda_tool::DeviceVar<int>             m_cpNum;
 
-        void build(cuda_tool::CBufferView<AABB> aabbs);
+        void build(cuda_tool::CBufferView<AABB> aabbs, bool reuse_order = false);
     };
 
     struct Node
@@ -142,7 +142,8 @@ class InfoStacklessBVH
                cuda_tool::CBuffer2DView<IndexT> cmts,
                NodePred                         np,
                LeafPred                         lp,
-               QueryBuffer&                     qbuffer);
+               QueryBuffer&                     qbuffer,
+               bool                             reuse_query_order = false);
 
     template <typename NodePred, typename LeafPred>
     void launch_query(cuda_tool::CBufferView<AABB>     query_aabbs,
@@ -152,7 +153,8 @@ class InfoStacklessBVH
                       NodePred                         np,
                       LeafPred                         lp,
                       QueryBuffer&                     qbuffer,
-                      bool                             rebuild_query = true);
+                      bool                             rebuild_query = true,
+                      bool                             reuse_query_order = false);
 
     // Publish a device-produced count and grow the output if a retry is
     // required. The caller relaunches the same query when this returns true.
