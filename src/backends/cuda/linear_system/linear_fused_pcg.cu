@@ -441,17 +441,29 @@ void LinearFusedPCG::run_graph_iteration(cuda_tool::DenseVectorView<Float> x,
                        d_converged.view(),
                        stream);
 
-    fused_update_xr(d_rz.view(),
-                    m_graph_pAp[slot].view(),
-                    d_converged.view(),
-                    x,
-                    p.cview(),
-                    r.view(),
-                    m_graph_Ap[slot].cview(),
-                    stream);
-
-    apply_preconditioner(z, r, d_converged.view(), stream);
-    fused_dot(r.cview(), z.cview(), d_rz_new.view(), stream);
+    const bool fused = fused_pcg_update_apply_dot(x,
+                                                  p.cview(),
+                                                  r.view(),
+                                                  m_graph_Ap[slot].cview(),
+                                                  z.view(),
+                                                  d_rz.view(),
+                                                  m_graph_pAp[slot].view(),
+                                                  d_rz_new.view(),
+                                                  d_converged.view(),
+                                                  stream);
+    if(!fused)
+    {
+        fused_update_xr(d_rz.view(),
+                        m_graph_pAp[slot].view(),
+                        d_converged.view(),
+                        x,
+                        p.cview(),
+                        r.view(),
+                        m_graph_Ap[slot].cview(),
+                        stream);
+        apply_preconditioner(z, r, d_converged.view(), stream);
+        fused_dot(r.cview(), z.cview(), d_rz_new.view(), stream);
+    }
     fused_update_converged(
         d_rz_new.view(), d_converged.view(), d_rz_tol.view(), stream);
     fused_update_p(

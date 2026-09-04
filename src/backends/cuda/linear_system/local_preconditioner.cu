@@ -31,6 +31,12 @@ void LocalPreconditioner::apply(GlobalLinearSystem::ApplyPreconditionerInfo& inf
     do_apply(info);
 }
 
+bool LocalPreconditioner::fused_pcg_update_apply_dot(
+    GlobalLinearSystem::FusedPcgUpdateApplyDotInfo& info)
+{
+    return do_fused_pcg_update_apply_dot(info);
+}
+
 void LocalPreconditioner::BuildInfo::connect(DiagLinearSubsystem* system)
 {
     m_subsystem = system;
