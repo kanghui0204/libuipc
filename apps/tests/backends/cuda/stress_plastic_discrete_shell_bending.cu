@@ -123,4 +123,55 @@ TEST_CASE("stress_plastic_discrete_shell_bending_helpers", "[cuda][stress_plasti
         SPDSB::ddEddx(H, x0, x1, x2, x3, 1.0, 1.0, 0.0, 1.0, 0.5);
         CHECK(H.cwiseAbs().maxCoeff() == Catch::Approx(0.0).margin(1e-12));
     }
+
+    SECTION("combined_gradient_hessian_matches_separate_helpers")
+    {
+        const Vector3 x0{0.0, 1.0, 0.2};
+        const Vector3 x1{-1.0, 0.0, 0.0};
+        const Vector3 x2{1.0, 0.0, 0.0};
+        const Vector3 x3{0.0, -1.0, -0.3};
+
+        for(const Float yield_stress : {Float(0.1), Float(10.0)})
+        {
+            Vector12 separate_G;
+            Vector12 combined_G;
+            Matrix12x12 separate_H;
+            Matrix12x12 combined_H;
+
+            SPDSB::dEdx(separate_G,
+                        x0,
+                        x1,
+                        x2,
+                        x3,
+                        1.2,
+                        0.8,
+                        0.15,
+                        2.0,
+                        yield_stress);
+            SPDSB::ddEddx(separate_H,
+                          x0,
+                          x1,
+                          x2,
+                          x3,
+                          1.2,
+                          0.8,
+                          0.15,
+                          2.0,
+                          yield_stress);
+            SPDSB::d2Edx2(combined_G,
+                          combined_H,
+                          x0,
+                          x1,
+                          x2,
+                          x3,
+                          1.2,
+                          0.8,
+                          0.15,
+                          2.0,
+                          yield_stress);
+
+            CHECK((combined_G.array() == separate_G.array()).all());
+            CHECK((combined_H.array() == separate_H.array()).all());
+        }
+    }
 }
