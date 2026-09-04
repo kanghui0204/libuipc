@@ -658,8 +658,9 @@ bool GlobalLinearSystem::Impl::fused_pcg_update_apply_dot(
                     && x.size() == Ap.size() && x.size() == z.size(),
                 "fused PCG vectors must have matching sizes");
 
-    CUDA_TOOL_CHECK(cudaMemsetAsync(rz_new.data(), 0, sizeof(Float), stream));
-
+    // Block replay supplies a zeroed ping-pong accumulation slot. Each local
+    // subsystem adds its contribution; the direction kernel clears the slot
+    // that the next iteration will consume.
     const auto diag_dof_counts  = diag_dof_offsets_counts.counts();
     const auto diag_dof_offsets = diag_dof_offsets_counts.offsets();
 
