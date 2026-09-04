@@ -1359,8 +1359,11 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::detect(DetectInfo& info)
         }
     }
 
-    lbvh_E.build(edge_aabbs, edge_bids, edge_cids);
-    lbvh_T.build(triangle_aabbs, triangle_bids, triangle_cids);
+    if(!info.reuse_bvh_topology() || !lbvh_E.refit(edge_aabbs, edge_bids, edge_cids))
+        lbvh_E.build(edge_aabbs, edge_bids, edge_cids);
+    if(!info.reuse_bvh_topology()
+       || !lbvh_T.refit(triangle_aabbs, triangle_bids, triangle_cids))
+        lbvh_T.build(triangle_aabbs, triangle_bids, triangle_cids);
 
     auto node_pred = InfoStacklessBVHSimplexTrajectoryFilter_detect_node_pred{
         body_self_collisions, cmts.viewer()};
@@ -1451,7 +1454,10 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::detect(DetectInfo& info)
 
     if(codimVs.size() > 0)
     {
-        lbvh_CodimP.build(codim_point_aabbs, codim_point_bids, codim_point_cids);
+        if(!info.reuse_bvh_topology()
+           || !lbvh_CodimP.refit(
+               codim_point_aabbs, codim_point_bids, codim_point_cids))
+            lbvh_CodimP.build(codim_point_aabbs, codim_point_bids, codim_point_cids);
         launch_allp_codimp(true);
     }
     else

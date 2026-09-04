@@ -10,6 +10,8 @@
 #include <array>
 #include <iterator>
 #include <list>
+#include <utility>
+#include <vector>
 
 namespace cuda_tool = uipc::backend::cuda_tool;
 using namespace cuda_tool;
@@ -626,6 +628,387 @@ void run_cta_queue_boundary_cases()
     }
 }
 
+struct RefitNodePred
+{
+    cuda_tool::CDense2D<IndexT> cmts;
+
+    UIPC_GENERIC bool operator()(const InfoStacklessBVH::NodePredInfo& info) const
+    {
+        constexpr IndexT invalid = static_cast<IndexT>(-1);
+        bool bid_cull = info.query_bid != invalid && info.node_bid != invalid
+                        && info.query_bid == info.node_bid;
+        bool cid_cull = info.query_cid != invalid && info.node_cid != invalid
+                        && !cmts(info.query_cid, info.node_cid);
+        return !(bid_cull || cid_cull);
+    }
+};
+
+struct RefitLeafPred
+{
+    cuda_tool::CDense2D<IndexT> cmts;
+
+    UIPC_GENERIC bool operator()(const InfoStacklessBVH::LeafPredInfo& info) const
+    {
+        return info.bid_i != info.bid_j && cmts(info.cid_i, info.cid_j);
+    }
+};
+
+struct RefitInputs
+{
+    std::vector<AABB>   aabbs;
+    std::vector<IndexT> bids;
+    std::vector<IndexT> cids;
+};
+
+AABB refit_box_at(double x, double radius)
+{
+    AABB box;
+    box.extend(Vector3{x - radius, -radius, -radius}.cast<float>());
+    box.extend(Vector3{x + radius, radius, radius}.cast<float>());
+    return box;
+}
+
+RefitInputs refit_initial_inputs(IndexT count)
+{
+    RefitInputs result;
+    result.aabbs.reserve(count);
+    result.bids.reserve(count);
+    result.cids.reserve(count);
+    for(IndexT i = 0; i < count; ++i)
+    {
+        result.aabbs.push_back(refit_box_at(3.0 * i, 0.25));
+        result.bids.push_back(i % 7);
+        result.cids.push_back(i % 4);
+    }
+    return result;
+}
+
+RefitInputs refit_swept_inputs(IndexT count, double phase)
+{
+    RefitInputs result;
+    result.aabbs.reserve(count);
+    result.bids.reserve(count);
+    result.cids.reserve(count);
+    for(IndexT i = 0; i < count; ++i)
+    {
+        // Reverse spatial order and overlap many leaves so a stale or
+        // incompletely published parent becomes visible in the exact pairs.
+        double x = 0.015 * (count - 1 - i) + phase * ((i % 3) - 1);
+        result.aabbs.push_back(refit_box_at(x, 0.65));
+        result.bids.push_back((i + 3) % 9);
+        result.cids.push_back((i + 1) % 4);
+    }
+    return result;
+}
+
+enum class RefitMetadataPhase
+{
+    Homogeneous,
+    DifferentHomogeneous,
+    Mixed
+};
+
+RefitInputs refit_grouped_inputs(IndexT             count,
+                                 RefitMetadataPhase phase,
+                                 bool               reverse_groups)
+{
+    constexpr IndexT group_size = 3;
+    REQUIRE(count % group_size == 0);
+
+    RefitInputs result;
+    result.aabbs.reserve(count);
+    result.bids.reserve(count);
+    result.cids.reserve(count);
+    IndexT group_count = count / group_size;
+    for(IndexT i = 0; i < count; ++i)
+    {
+        IndexT group         = i / group_size;
+        IndexT local         = i % group_size;
+        IndexT spatial_group = reverse_groups ? group_count - 1 - group : group;
+        result.aabbs.push_back(refit_box_at(10.0 * spatial_group + 0.15 * local, 0.2));
+
+        switch(phase)
+        {
+            case RefitMetadataPhase::Homogeneous:
+                result.bids.push_back(17);
+                result.cids.push_back(1);
+                break;
+            case RefitMetadataPhase::DifferentHomogeneous:
+                result.bids.push_back(29);
+                result.cids.push_back(2);
+                break;
+            case RefitMetadataPhase::Mixed:
+                result.bids.push_back(i);
+                result.cids.push_back(local);
+                break;
+        }
+    }
+    return result;
+}
+
+RefitInputs refit_grouped_queries(IndexT group_count, IndexT bid, IndexT cid)
+{
+    RefitInputs result;
+    result.aabbs.reserve(group_count);
+    result.bids.reserve(group_count);
+    result.cids.reserve(group_count);
+    for(IndexT group = 0; group < group_count; ++group)
+    {
+        result.aabbs.push_back(refit_box_at(10.0 * group + 0.15, 0.4));
+        result.bids.push_back(bid);
+        result.cids.push_back(cid);
+    }
+    return result;
+}
+
+void upload_refit(const RefitInputs&       input,
+                  DeviceBuffer<AABB>&      aabbs,
+                  DeviceBuffer<IndexT>&    bids,
+                  DeviceBuffer<IndexT>&    cids)
+{
+    aabbs.resize(input.aabbs.size());
+    bids.resize(input.bids.size());
+    cids.resize(input.cids.size());
+    if(!input.aabbs.empty())
+    {
+        aabbs.view().copy_from(input.aabbs.data());
+        bids.view().copy_from(input.bids.data());
+        cids.view().copy_from(input.cids.data());
+    }
+}
+
+std::vector<Vector2i> refit_detect_pairs(InfoStacklessBVH&          bvh,
+                                         CBuffer2DView<IndexT>       cmts)
+{
+    InfoStacklessBVH::QueryBuffer pairs;
+    pairs.m_pairs.release();
+    pairs.reserve(1);
+    bvh.detect(cmts, RefitNodePred{cmts.viewer()}, RefitLeafPred{cmts.viewer()}, pairs);
+
+    std::vector<Vector2i> result(pairs.size());
+    if(!result.empty())
+        pairs.view().copy_to(result.data());
+    return result;
+}
+
+std::vector<Vector2i> refit_query_pairs(InfoStacklessBVH&       bvh,
+                                        CBufferView<AABB>       query_aabbs,
+                                        CBufferView<IndexT>     query_bids,
+                                        CBufferView<IndexT>     query_cids,
+                                        CBuffer2DView<IndexT>   cmts)
+{
+    InfoStacklessBVH::QueryBuffer pairs;
+    pairs.m_pairs.release();
+    pairs.reserve(1);
+    bvh.query(query_aabbs,
+              query_bids,
+              query_cids,
+              cmts,
+              RefitNodePred{cmts.viewer()},
+              RefitLeafPred{cmts.viewer()},
+              pairs);
+
+    std::vector<Vector2i> result(pairs.size());
+    if(!result.empty())
+        pairs.view().copy_to(result.data());
+    return result;
+}
+
+size_t check_refit_pairs(std::vector<Vector2i> refitted,
+                         std::vector<Vector2i> rebuilt)
+{
+    size_t count = refitted.size();
+    check_cp_exact(std::move(refitted), std::move(rebuilt));
+    return count;
+}
+
+void compare_full_build_and_refit(const RefitInputs& initial,
+                                  const RefitInputs& swept,
+                                  CBuffer2DView<IndexT> cmts)
+{
+    DeviceBuffer<AABB>   refit_aabbs;
+    DeviceBuffer<IndexT> refit_bids;
+    DeviceBuffer<IndexT> refit_cids;
+    upload_refit(initial, refit_aabbs, refit_bids, refit_cids);
+
+    InfoStacklessBVH refitted;
+    refitted.build(refit_aabbs, refit_bids, refit_cids);
+    upload_refit(swept, refit_aabbs, refit_bids, refit_cids);
+    REQUIRE(refitted.refit(refit_aabbs, refit_bids, refit_cids));
+
+    DeviceBuffer<AABB>   rebuilt_aabbs;
+    DeviceBuffer<IndexT> rebuilt_bids;
+    DeviceBuffer<IndexT> rebuilt_cids;
+    upload_refit(swept, rebuilt_aabbs, rebuilt_bids, rebuilt_cids);
+    InfoStacklessBVH rebuilt;
+    rebuilt.build(rebuilt_aabbs, rebuilt_bids, rebuilt_cids);
+
+    check_refit_pairs(refit_detect_pairs(refitted, cmts),
+                      refit_detect_pairs(rebuilt, cmts));
+
+    auto query = refit_swept_inputs(11, 0.025);
+    DeviceBuffer<AABB>   query_aabbs;
+    DeviceBuffer<IndexT> query_bids;
+    DeviceBuffer<IndexT> query_cids;
+    upload_refit(query, query_aabbs, query_bids, query_cids);
+    check_refit_pairs(refit_query_pairs(refitted,
+                                        query_aabbs,
+                                        query_bids,
+                                        query_cids,
+                                        cmts),
+                      refit_query_pairs(rebuilt,
+                                        query_aabbs,
+                                        query_bids,
+                                        query_cids,
+                                        cmts));
+}
+
+void run_refit_cases()
+{
+    constexpr IndexT cid_count = 4;
+    std::vector<IndexT> cmts(cid_count * cid_count);
+    for(IndexT i = 0; i < cid_count; ++i)
+        for(IndexT j = 0; j < cid_count; ++j)
+            cmts[i * cid_count + j] = ((i + j) % 3) != 0;
+    DeviceBuffer2D<IndexT> d_cmts(Extent2D{cid_count, cid_count});
+    d_cmts.view().copy_from(cmts.data());
+
+    SECTION("empty")
+    {
+        DeviceBuffer<AABB>   aabbs;
+        DeviceBuffer<IndexT> bids;
+        DeviceBuffer<IndexT> cids;
+        InfoStacklessBVH     bvh;
+        bvh.build(aabbs, bids, cids);
+        CHECK(bvh.refit(aabbs, bids, cids));
+        CHECK(refit_detect_pairs(bvh, d_cmts.view()).empty());
+    }
+
+    SECTION("single primitive")
+    {
+        compare_full_build_and_refit(
+            refit_initial_inputs(1), refit_swept_inputs(1, 0.0), d_cmts.view());
+    }
+
+    SECTION("swept topology and metadata")
+    {
+        compare_full_build_and_refit(
+            refit_initial_inputs(33), refit_swept_inputs(33, 0.0), d_cmts.view());
+    }
+
+    SECTION("repeated refit")
+    {
+        auto initial = refit_initial_inputs(33);
+        auto swept0  = refit_swept_inputs(33, 0.0);
+        auto swept1  = refit_swept_inputs(33, 0.04);
+
+        DeviceBuffer<AABB>   aabbs;
+        DeviceBuffer<IndexT> bids;
+        DeviceBuffer<IndexT> cids;
+        upload_refit(initial, aabbs, bids, cids);
+        InfoStacklessBVH refitted;
+        refitted.build(aabbs, bids, cids);
+        upload_refit(swept0, aabbs, bids, cids);
+        REQUIRE(refitted.refit(aabbs, bids, cids));
+        upload_refit(swept1, aabbs, bids, cids);
+        REQUIRE(refitted.refit(aabbs, bids, cids));
+
+        DeviceBuffer<AABB>   rebuilt_aabbs;
+        DeviceBuffer<IndexT> rebuilt_bids;
+        DeviceBuffer<IndexT> rebuilt_cids;
+        upload_refit(swept1, rebuilt_aabbs, rebuilt_bids, rebuilt_cids);
+        InfoStacklessBVH rebuilt;
+        rebuilt.build(rebuilt_aabbs, rebuilt_bids, rebuilt_cids);
+        check_refit_pairs(refit_detect_pairs(refitted, d_cmts.view()),
+                          refit_detect_pairs(rebuilt, d_cmts.view()));
+    }
+
+    SECTION("count change fails closed")
+    {
+        auto initial = refit_initial_inputs(8);
+        DeviceBuffer<AABB>   aabbs;
+        DeviceBuffer<IndexT> bids;
+        DeviceBuffer<IndexT> cids;
+        upload_refit(initial, aabbs, bids, cids);
+        InfoStacklessBVH bvh;
+        bvh.build(aabbs, bids, cids);
+        auto changed = refit_swept_inputs(9, 0.0);
+        upload_refit(changed, aabbs, bids, cids);
+        CHECK_FALSE(bvh.refit(aabbs, bids, cids));
+    }
+
+    SECTION("cross CTA metadata transitions and overflow")
+    {
+        constexpr IndexT primitive_count = 1536;
+        constexpr IndexT group_size      = 3;
+        static_assert(primitive_count > 1024);
+
+        DeviceBuffer<AABB>   refit_aabbs;
+        DeviceBuffer<IndexT> refit_bids;
+        DeviceBuffer<IndexT> refit_cids;
+        upload_refit(refit_grouped_inputs(
+                         primitive_count, RefitMetadataPhase::Homogeneous, false),
+                     refit_aabbs,
+                     refit_bids,
+                     refit_cids);
+        InfoStacklessBVH refitted;
+        refitted.build(refit_aabbs, refit_bids, refit_cids);
+
+        auto compare_refit_with_rebuild = [&](const RefitInputs& state,
+                                              const RefitInputs& query)
+        {
+            upload_refit(state, refit_aabbs, refit_bids, refit_cids);
+            REQUIRE(refitted.refit(refit_aabbs, refit_bids, refit_cids));
+
+            DeviceBuffer<AABB>   rebuilt_aabbs;
+            DeviceBuffer<IndexT> rebuilt_bids;
+            DeviceBuffer<IndexT> rebuilt_cids;
+            upload_refit(state, rebuilt_aabbs, rebuilt_bids, rebuilt_cids);
+            InfoStacklessBVH rebuilt;
+            rebuilt.build(rebuilt_aabbs, rebuilt_bids, rebuilt_cids);
+
+            size_t self_count = check_refit_pairs(
+                refit_detect_pairs(refitted, d_cmts.view()),
+                refit_detect_pairs(rebuilt, d_cmts.view()));
+
+            DeviceBuffer<AABB>   query_aabbs;
+            DeviceBuffer<IndexT> query_bids;
+            DeviceBuffer<IndexT> query_cids;
+            upload_refit(query, query_aabbs, query_bids, query_cids);
+            size_t other_count = check_refit_pairs(
+                refit_query_pairs(refitted,
+                                  query_aabbs,
+                                  query_bids,
+                                  query_cids,
+                                  d_cmts.view()),
+                refit_query_pairs(rebuilt,
+                                  query_aabbs,
+                                  query_bids,
+                                  query_cids,
+                                  d_cmts.view()));
+            return std::pair{self_count, other_count};
+        };
+
+        auto different = refit_grouped_inputs(
+            primitive_count, RefitMetadataPhase::DifferentHomogeneous, true);
+        auto query_old_homogeneous =
+            refit_grouped_queries(primitive_count / group_size, 17, 2);
+        auto [different_self, different_other] =
+            compare_refit_with_rebuild(different, query_old_homogeneous);
+        CHECK(different_self == 0);
+        CHECK(different_other > 1);
+
+        auto mixed = refit_grouped_inputs(
+            primitive_count, RefitMetadataPhase::Mixed, false);
+        auto query_old_different =
+            refit_grouped_queries(primitive_count / group_size, 29, 1);
+        auto [mixed_self, mixed_other] =
+            compare_refit_with_rebuild(mixed, query_old_different);
+        CHECK(mixed_self > 1);
+        CHECK(mixed_other > 1);
+    }
+}
+
 void run_internal_cull_rate_case()
 {
     constexpr IndexT    n = 96;
@@ -927,4 +1310,11 @@ TEST_CASE("info_stackless_bvh CTA and queue boundaries",
                  uipc::info_stackless_detail::K_OTHER_THREADS,
                  uipc::info_stackless_detail::K_OTHER_MAX_RES_PER_BLOCK);
     run_cta_queue_boundary_cases();
+}
+
+TEST_CASE("info_stackless_bvh topology refit",
+          "[collision detection][bvh_refit][line_search]")
+{
+    using namespace test_info_stackless_bvh;
+    run_refit_cases();
 }

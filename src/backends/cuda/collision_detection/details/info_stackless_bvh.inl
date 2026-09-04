@@ -478,14 +478,19 @@ namespace
     __global__ void InfoStacklessBVH_reorderNode_kernel(
         int                                           int_size,
         cuda_tool::BufferView<int>                    _lvs_lca,
+        cuda_tool::BufferView<uint32_t>               _lvs_par,
         cuda_tool::BufferView<AABB>                   _lvs_box,
         cuda_tool::BufferView<IndexT>                 _lvs_bid,
         cuda_tool::BufferView<IndexT>                 _lvs_cid,
         cuda_tool::BufferView<int>                    _tk_map,
         cuda_tool::BufferView<int>                    _int_lc,
+        cuda_tool::BufferView<int>                    _int_rc,
+        cuda_tool::BufferView<int>                    _int_par,
         cuda_tool::BufferView<uint32_t>               _int_mark,
         cuda_tool::BufferView<int>                    _int_range_y,
         cuda_tool::BufferView<int>                    _self_max_rank,
+        cuda_tool::BufferView<int>                    _refit_parent,
+        cuda_tool::BufferView<int>                    _refit_right,
         cuda_tool::BufferView<AABB>                   _int_box,
         cuda_tool::BufferView<IndexT>                 _int_bid,
         cuda_tool::BufferView<IndexT>                 _int_cid,
@@ -510,6 +515,8 @@ namespace
         leaf.bid               = _lvs_bid(idx);
         leaf.cid               = _lvs_cid(idx);
         _nodes(idx + int_size) = leaf;
+        _refit_parent(idx + int_size) =
+            int_size == 0 ? -1 : static_cast<int>(_lvs_par(idx));
 
         if(idx >= int_size)
             return;
@@ -519,6 +526,10 @@ namespace
         uint32_t               m      = _int_mark(idx);
         _self_max_rank(new_id)        = _int_range_y(idx);
         n.lc    = (m & 1) ? _int_lc(idx) + int_size : _tk_map(_int_lc(idx));
+        _refit_right(new_id) =
+            (m & 2) ? _int_rc(idx) + int_size : _tk_map(_int_rc(idx));
+        int old_parent       = _int_par(idx);
+        _refit_parent(new_id) = old_parent == -1 ? -1 : _tk_map(old_parent);
         n.bound = _int_box(idx);
         int ie  = _lvs_lca(_int_range_y(idx) + 1);
         if(ie == -1)
@@ -532,6 +543,63 @@ namespace
         n.bid          = _int_bid(idx);
         n.cid          = _int_cid(idx);
         _nodes(new_id) = n;
+    }
+
+    __global__ void InfoStacklessBVH_refit_kernel(
+        int                                           int_size,
+        cuda_tool::CBufferView<AABB>                  _aabbs,
+        cuda_tool::CBufferView<IndexT>                _bids,
+        cuda_tool::CBufferView<IndexT>                _cids,
+        cuda_tool::CBufferView<int>                   _lvs_idx,
+        cuda_tool::BufferView<AABB>                   _lvs_box,
+        cuda_tool::BufferView<IndexT>                 _lvs_bid,
+        cuda_tool::BufferView<IndexT>                 _lvs_cid,
+        cuda_tool::BufferView<InfoStacklessBVH::Node> _nodes,
+        cuda_tool::CBufferView<int>                   _parent,
+        cuda_tool::CBufferView<int>                   _right,
+        cuda_tool::BufferView<int>                    _arrivals,
+        int                                           n)
+    {
+        constexpr IndexT invalid = static_cast<IndexT>(-1);
+        int              rank    = blockIdx.x * blockDim.x + threadIdx.x;
+        if(rank >= n)
+            return;
+
+        int raw_id  = _lvs_idx(rank);
+        int leaf_id = int_size + rank;
+
+        InfoStacklessBVH::Node leaf = _nodes(leaf_id);
+        leaf.bound                   = _aabbs(raw_id);
+        leaf.bid                     = _bids(raw_id);
+        leaf.cid                     = _cids(raw_id);
+        _nodes(leaf_id)              = leaf;
+        _lvs_box(rank)               = leaf.bound;
+        _lvs_bid(rank)               = leaf.bid;
+        _lvs_cid(rank)               = leaf.cid;
+
+        // Publish the leaf before announcing its arrival. The first child at
+        // each parent stops; the second observes both children, publishes the
+        // merged node, and carries completion toward the root.
+        __threadfence();
+        int parent = _parent(leaf_id);
+        while(parent != -1)
+        {
+            if(atomicAdd(&_arrivals(parent), 1) == 0)
+                break;
+
+            __threadfence();
+            auto node  = _nodes(parent);
+            auto left  = _nodes(node.lc);
+            auto right = _nodes(_right(parent));
+            node.bound = left.bound;
+            node.bound.extend(right.bound);
+            node.bid       = left.bid == right.bid ? left.bid : invalid;
+            node.cid       = left.cid == right.cid ? left.cid : invalid;
+            _nodes(parent) = node;
+
+            __threadfence();
+            parent = _parent(parent);
+        }
     }
 
     template <typename NodeCull, typename PairPred>
@@ -891,14 +959,19 @@ inline void InfoStacklessBVH::Impl::reorderNode(int int_size)
         k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
             int_size,
             ext_lca.view(),
+            ext_par.view(),
             ext_aabb.view(),
             ext_bid.view(),
             ext_cid.view(),
             tkMap.view(),
             int_lc.view(),
+            int_rc.view(),
+            int_par.view(),
             int_mark.view(),
             int_range_y.view(),
             self_max_rank.view(),
+            refit_parent.view(),
+            refit_right_child.view(),
             int_aabb.view(),
             int_bid.view(),
             int_cid.view(),
@@ -947,6 +1020,9 @@ inline void InfoStacklessBVH::Impl::build(cuda_tool::CBufferView<AABB>   aabbs,
     int_bid.resize(num_internal);
     int_cid.resize(num_internal);
     nodes.resize(num_nodes);
+    refit_parent.resize(num_nodes);
+    refit_right_child.resize(num_internal);
+    refit_arrivals.resize(num_internal);
 
     auto init = InfoStacklessBVH_initializeBuildState_kernel;
     auto n    = static_cast<int>(num_objs);
@@ -971,6 +1047,56 @@ inline void InfoStacklessBVH::Impl::build(cuda_tool::CBufferView<AABB>   aabbs,
     calcIntNodeOrders(num_objs);
     updateBvhExtNodeLinks(num_objs);
     reorderNode(num_internal);
+}
+
+inline bool InfoStacklessBVH::Impl::refit(cuda_tool::CBufferView<AABB>   aabbs,
+                                          cuda_tool::CBufferView<IndexT> _bids,
+                                          cuda_tool::CBufferView<IndexT> _cids)
+{
+    auto num_objs = aabbs.size();
+    if(num_objs != objs.size() || _bids.size() != num_objs || _cids.size() != num_objs)
+        return false;
+
+    if(num_objs == 0)
+    {
+        objs = aabbs;
+        bids = _bids;
+        cids = _cids;
+        return true;
+    }
+
+    auto num_internal = num_objs - 1;
+    auto num_nodes    = num_objs * 2 - 1;
+    if(nodes.size() != num_nodes || ext_idx.size() != num_objs
+       || ext_aabb.size() != num_objs || ext_bid.size() != num_objs
+       || ext_cid.size() != num_objs || refit_parent.size() != num_nodes
+       || refit_right_child.size() != num_internal
+       || refit_arrivals.size() != num_internal)
+        return false;
+
+    objs = aabbs;
+    bids = _bids;
+    cids = _cids;
+
+    cuda_tool::BufferLaunch().fill(refit_arrivals.view(), 0);
+
+    auto k = InfoStacklessBVH_refit_kernel;
+    auto n = static_cast<int>(num_objs);
+    k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
+        static_cast<int>(num_internal),
+        aabbs,
+        _bids,
+        _cids,
+        ext_idx.view(),
+        ext_aabb.view(),
+        ext_bid.view(),
+        ext_cid.view(),
+        nodes.view(),
+        refit_parent.view(),
+        refit_right_child.view(),
+        refit_arrivals.view(),
+        n);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,6 +1230,23 @@ inline void InfoStacklessBVH::build(cuda_tool::CBufferView<AABB> aabbs)
     m_BIDs  = {};
     m_CIDs  = {};
     m_impl.build(aabbs, {}, {});
+}
+
+inline bool InfoStacklessBVH::refit(cuda_tool::CBufferView<AABB>   aabbs,
+                                    cuda_tool::CBufferView<IndexT> BIDs,
+                                    cuda_tool::CBufferView<IndexT> CIDs)
+{
+    if(aabbs.size() != m_aabbs.size() || aabbs.size() != BIDs.size()
+       || aabbs.size() != CIDs.size())
+        return false;
+
+    if(!m_impl.refit(aabbs, BIDs, CIDs))
+        return false;
+
+    m_aabbs = aabbs;
+    m_BIDs  = BIDs;
+    m_CIDs  = CIDs;
+    return true;
 }
 
 inline bool InfoStacklessBVH::prepare_query_result(QueryBuffer& qbuffer, int count)

@@ -31,10 +31,12 @@ class GlobalTrajectoryFilter final : public SimSystem
     {
       public:
         Float alpha() const noexcept { return m_alpha; }
+        bool  reuse_bvh_topology() const noexcept { return m_reuse_bvh_topology; }
 
       private:
         friend class GlobalTrajectoryFilter;
-        Float m_alpha = 0.0;
+        Float m_alpha              = 0.0;
+        bool  m_reuse_bvh_topology = false;
     };
 
     class FilterActiveInfo
@@ -101,7 +103,8 @@ class GlobalTrajectoryFilter final : public SimSystem
 
     friend class SimEngine;
     friend class ContactExporterManager;
-    void detect(Float alpha);  // called by SimEngine and ContactExporterManager
+    void detect(Float alpha,
+                bool reuse_bvh_topology = false);  // called by SimEngine and ContactExporterManager
     void filter_active();      // called by SimEngine and ContactExporterManager
 
     Float filter_toi(Float alpha);       // only called by SimEngine
