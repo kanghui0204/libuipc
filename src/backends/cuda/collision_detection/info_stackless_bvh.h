@@ -217,6 +217,9 @@ class InfoStacklessBVH
         cuda_tool::DeviceVector<int>      int_par;
         cuda_tool::DeviceVector<int>      int_range_x;
         cuda_tool::DeviceVector<int>      int_range_y;
+        // Maximum Morton-sorted leaf rank for each reordered internal node.
+        // stacklessSelf uses it to skip the already-covered half-tree.
+        cuda_tool::DeviceVector<int>      self_max_rank;
         cuda_tool::DeviceVector<uint32_t> int_mark;
         cuda_tool::DeviceVector<AABB>     int_aabb;
         cuda_tool::DeviceVector<IndexT>   ext_bid;

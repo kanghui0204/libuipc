@@ -7,6 +7,7 @@
 #include <uipc/common/enumerate.h>
 #include <uipc/common/timer.h>
 #include <algorithm>
+#include <array>
 #include <iterator>
 #include <list>
 
@@ -188,6 +189,22 @@ void check_cp_conservative(span<Vector2i> test, span<Vector2i> gt)
         gt.begin(), gt.end(), test.begin(), test.end(), std::back_inserter(diff), compare);
 
     CHECK(diff.empty());
+}
+
+void check_cp_exact(std::vector<Vector2i> test, std::vector<Vector2i> gt)
+{
+    auto compare = [](const Vector2i& lhs, const Vector2i& rhs)
+    { return lhs[0] < rhs[0] || (lhs[0] == rhs[0] && lhs[1] < rhs[1]); };
+
+    std::ranges::sort(test, compare);
+    std::ranges::sort(gt, compare);
+    REQUIRE(test.size() == gt.size());
+    for(size_t i = 0; i < gt.size(); ++i)
+    {
+        CAPTURE(i);
+        CHECK(test[i][0] == gt[i][0]);
+        CHECK(test[i][1] == gt[i][1]);
+    }
 }
 
 bool allow_contact(span<const IndexT> cmts, IndexT cid_count, IndexT lhs, IndexT rhs)
@@ -412,9 +429,53 @@ void run_internal_cull_proof_case()
                  h_leaf_pair_calls,
                  h_pairs);
 
-    CHECK(h_node_cull_calls == n);
+    // The final Morton-rank query skips the root because no greater-ranked
+    // leaf can exist below it. All other queries reach and reject the root.
+    CHECK(h_node_cull_calls == n - 1);
     CHECK(h_leaf_pair_calls == 0);
     CHECK(h_pairs == 0);
+}
+
+void run_self_rank_reordered_node_case()
+{
+    // Raw ids 0,1,2,3 have Morton order 1,3,2,0. Distinct centers avoid any
+    // dependence on radix-sort tie order; the common extent overlaps all pairs.
+    constexpr std::array<float, 4> x_by_raw_id = {3.0f, 0.0f, 2.0f, 1.0f};
+    std::vector<AABB>              aabbs;
+    for(float x : x_by_raw_id)
+    {
+        AABB box;
+        box.extend(Vector3{x, 0.0, 0.0}.cast<float>());
+        box.extend(Vector3{x + 4.0, 4.0, 4.0}.cast<float>());
+        aabbs.push_back(box);
+    }
+
+    std::vector<IndexT>  bids(aabbs.size(), 0);
+    std::vector<IndexT>  cids(aabbs.size(), 0);
+    DeviceBuffer<AABB>   d_aabbs(aabbs.size());
+    DeviceBuffer<IndexT> d_bids(bids.size());
+    DeviceBuffer<IndexT> d_cids(cids.size());
+    d_aabbs.view().copy_from(aabbs.data());
+    d_bids.view().copy_from(bids.data());
+    d_cids.view().copy_from(cids.data());
+
+    DeviceBuffer2D<IndexT> d_cmts(Extent2D{1, 1});
+    IndexT                  allow = 1;
+    d_cmts.view().copy_from(&allow);
+
+    InfoStacklessBVH bvh;
+    bvh.build(d_aabbs.view(), d_bids.view(), d_cids.view());
+    InfoStacklessBVH::QueryBuffer qbuffer;
+    qbuffer.reserve(8);
+    bvh.detect(d_cmts.view(), NodePred{}, LeafPredTrue{}, qbuffer);
+
+    std::vector<Vector2i> actual(qbuffer.size());
+    qbuffer.view().copy_to(actual.data());
+    std::vector<Vector2i> expected;
+    for(IndexT i = 0; i < static_cast<IndexT>(aabbs.size()); ++i)
+        for(IndexT j = i + 1; j < static_cast<IndexT>(aabbs.size()); ++j)
+            expected.emplace_back(i, j);
+    check_cp_exact(std::move(actual), std::move(expected));
 }
 
 void run_internal_cull_rate_case()
@@ -698,4 +759,12 @@ TEST_CASE("info_stackless_bvh", "[collision detection]")
         fmt::println("two_leaf_nodepred_cases:");
         run_two_leaf_nodepred_cases();
     }
+}
+
+TEST_CASE("info_stackless_bvh self Morton-rank pruning",
+          "[collision detection][self_rank_pruning]")
+{
+    using namespace test_info_stackless_bvh;
+    run_internal_cull_proof_case();
+    run_self_rank_reordered_node_case();
 }
