@@ -17,9 +17,40 @@ using Vector2i = uipc::Vector2i;
 using uint     = uint32_t;
 using ullint   = unsigned long long;
 
-constexpr int  K_THREADS         = 256;
-constexpr int  K_WARPS           = K_THREADS >> 5;
-constexpr int  MAX_RES_PER_BLOCK = 1024;
+#ifndef UIPC_INFO_STACKLESS_BVH_SELF_THREADS
+#define UIPC_INFO_STACKLESS_BVH_SELF_THREADS 256
+#endif
+#ifndef UIPC_INFO_STACKLESS_BVH_SELF_QUEUE_SLOTS_PER_THREAD
+#define UIPC_INFO_STACKLESS_BVH_SELF_QUEUE_SLOTS_PER_THREAD 4
+#endif
+#ifndef UIPC_INFO_STACKLESS_BVH_OTHER_THREADS
+#define UIPC_INFO_STACKLESS_BVH_OTHER_THREADS 256
+#endif
+#ifndef UIPC_INFO_STACKLESS_BVH_OTHER_QUEUE_SLOTS_PER_THREAD
+#define UIPC_INFO_STACKLESS_BVH_OTHER_QUEUE_SLOTS_PER_THREAD 4
+#endif
+
+constexpr int K_BUILD_THREADS = 256;
+constexpr int K_BUILD_WARPS   = K_BUILD_THREADS >> 5;
+
+constexpr int K_SELF_THREADS = UIPC_INFO_STACKLESS_BVH_SELF_THREADS;
+constexpr int K_SELF_QUEUE_SLOTS_PER_THREAD =
+    UIPC_INFO_STACKLESS_BVH_SELF_QUEUE_SLOTS_PER_THREAD;
+constexpr int K_SELF_MAX_RES_PER_BLOCK =
+    K_SELF_THREADS * K_SELF_QUEUE_SLOTS_PER_THREAD;
+
+constexpr int K_OTHER_THREADS = UIPC_INFO_STACKLESS_BVH_OTHER_THREADS;
+constexpr int K_OTHER_QUEUE_SLOTS_PER_THREAD =
+    UIPC_INFO_STACKLESS_BVH_OTHER_QUEUE_SLOTS_PER_THREAD;
+constexpr int K_OTHER_MAX_RES_PER_BLOCK =
+    K_OTHER_THREADS * K_OTHER_QUEUE_SLOTS_PER_THREAD;
+
+static_assert(K_BUILD_THREADS % 32 == 0);
+static_assert(K_SELF_THREADS > 0 && K_SELF_THREADS <= 1024 && K_SELF_THREADS % 32 == 0);
+static_assert(K_OTHER_THREADS > 0 && K_OTHER_THREADS <= 1024
+              && K_OTHER_THREADS % 32 == 0);
+static_assert(K_SELF_QUEUE_SLOTS_PER_THREAD > 0);
+static_assert(K_OTHER_QUEUE_SLOTS_PER_THREAD > 0);
 constexpr int  AABB_BITS         = 15;
 constexpr uint AABB_MASK         = 0xFFFFFFFFu >> (32 - AABB_BITS);
 
@@ -165,7 +196,7 @@ namespace
         size_t size, cuda_tool::CBufferView<AABB> box, cuda_tool::Dense<AABB> out)
     {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        __shared__ PlainAABB warp_boxes[K_WARPS];
+        __shared__ PlainAABB warp_boxes[K_BUILD_WARPS];
         int                  warp_tid = threadIdx.x & 31;
         int                  warp_id  = threadIdx.x >> 5;
 
@@ -202,7 +233,7 @@ namespace
         if(warp_id == 0)
         {
             constexpr float max_float = 3.402823466e+38F;
-            if(warp_tid < K_WARPS)
+            if(warp_tid < K_BUILD_WARPS)
                 temp = warp_boxes[warp_tid];
             else
             {
@@ -533,20 +564,15 @@ namespace
 
         // -----------------------------------------------------------------
         // SMem: pre-load query bid/cid once per thread, before hot loop.
-        // Shared memory layout (per block, K_THREADS=256):
-        //   s_qbid[256]   = 1 KB
-        //   s_qcid[256]   = 1 KB
-        //   shared_res[1024 * sizeof(int2)] = 8 KB   (existing)
-        //   shared_counter, shared_global_idx         (existing)
-        // Total: ~10 KB — well within the 48 KB limit.
+        // Shared storage follows the independently swept Self CTA and queue.
         // -----------------------------------------------------------------
-        __shared__ IndexT s_qbid[K_THREADS];
-        __shared__ IndexT s_qcid[K_THREADS];
+        __shared__ IndexT s_qbid[K_SELF_THREADS];
+        __shared__ IndexT s_qcid[K_SELF_THREADS];
 
         s_qbid[threadIdx.x] = (active && has_info) ? _bids(idx) : invalid;
         s_qcid[threadIdx.x] = (active && has_info) ? _cids(idx) : invalid;
 
-        __shared__ int2 shared_res[MAX_RES_PER_BLOCK];
+        __shared__ int2 shared_res[K_SELF_MAX_RES_PER_BLOCK];
         __shared__ int  shared_counter;
         __shared__ int  shared_global_idx;
         if(threadIdx.x == 0)
@@ -604,7 +630,7 @@ namespace
                             if(pair_pred(leaf_info))
                             {
                                 int sidx = atomicAdd(&shared_counter, 1);
-                                if(sidx >= MAX_RES_PER_BLOCK)
+                                if(sidx >= K_SELF_MAX_RES_PER_BLOCK)
                                     break;
                                 shared_res[sidx] = pair;
                             }
@@ -617,14 +643,14 @@ namespace
                 UIPC_KERNEL_ASSERT(inner_i < max_iter, "Exceeded max stackless iteration");
             }
             __syncthreads();
-            int total = min(shared_counter, MAX_RES_PER_BLOCK);
+            int total = min(shared_counter, K_SELF_MAX_RES_PER_BLOCK);
             if(threadIdx.x == 0)
                 shared_global_idx = atomicAdd(resCounter.data(), total);
             __syncthreads();
             int gidx = shared_global_idx;
             if(threadIdx.x == 0)
                 shared_counter = 0;
-            bool done = total < MAX_RES_PER_BLOCK;
+            bool done = total < K_SELF_MAX_RES_PER_BLOCK;
             safe_copy_to(shared_res, total, res.data(), gidx, static_cast<int>(res.total_size()));
             if(done)
                 break;
@@ -662,13 +688,13 @@ namespace
         // -----------------------------------------------------------------
         // SMem: pre-load per-query bid/cid before the traversal loop.
         // -----------------------------------------------------------------
-        __shared__ IndexT s_qbid[K_THREADS];
-        __shared__ IndexT s_qcid[K_THREADS];
+        __shared__ IndexT s_qbid[K_OTHER_THREADS];
+        __shared__ IndexT s_qcid[K_OTHER_THREADS];
 
         s_qbid[threadIdx.x] = (active && qhas_info) ? _qbids(idx) : invalid;
         s_qcid[threadIdx.x] = (active && qhas_info) ? _qcids(idx) : invalid;
 
-        __shared__ int2 shared_res[MAX_RES_PER_BLOCK];
+        __shared__ int2 shared_res[K_OTHER_MAX_RES_PER_BLOCK];
         __shared__ int  shared_counter;
         __shared__ int  shared_global_idx;
         if(threadIdx.x == 0)
@@ -712,7 +738,7 @@ namespace
                         if(pair_pred(leaf_info))
                         {
                             int sidx = atomicAdd(&shared_counter, 1);
-                            if(sidx >= MAX_RES_PER_BLOCK)
+                            if(sidx >= K_OTHER_MAX_RES_PER_BLOCK)
                                 break;
                             shared_res[sidx] = pair;
                         }
@@ -725,7 +751,7 @@ namespace
             }
 
             __syncthreads();
-            int total = min(shared_counter, MAX_RES_PER_BLOCK);
+            int total = min(shared_counter, K_OTHER_MAX_RES_PER_BLOCK);
             if(threadIdx.x == 0)
                 shared_global_idx = atomicAdd(resCounter.data(), total);
             __syncthreads();
@@ -733,7 +759,7 @@ namespace
             if(threadIdx.x == 0)
                 shared_counter = 0;
             __syncthreads();
-            bool done = total < MAX_RES_PER_BLOCK;
+            bool done = total < K_OTHER_MAX_RES_PER_BLOCK;
             safe_copy_to(shared_res, total, res.data(), gidx, static_cast<int>(res.total_size()));
             if(done)
                 break;
@@ -754,10 +780,10 @@ inline void InfoStacklessBVH::Impl::calcMaxBVFromBox(cuda_tool::CBufferView<AABB
         return;
 
     auto num  = aabbs.size();
-    auto grid = (num + K_THREADS - 1) / K_THREADS;
+    auto grid = (num + K_BUILD_THREADS - 1) / K_BUILD_THREADS;
 
     if(grid > 0)
-        InfoStacklessBVH_calcMaxBVFromBox_kernel<<<grid, K_THREADS, 0, nullptr>>>(
+        InfoStacklessBVH_calcMaxBVFromBox_kernel<<<grid, K_BUILD_THREADS, 0, nullptr>>>(
             aabbs.size(), aabbs, scene_box.viewer());
 }
 
@@ -962,13 +988,13 @@ void InfoStacklessBVH::Impl::stacklessSelf(NodeCull                node_cull,
 {
     auto num_query = static_cast<int>(ext_aabb.size());
     auto num_objs  = num_query;
-    auto grid      = (num_query + K_THREADS - 1) / K_THREADS;
+    auto grid      = (num_query + K_SELF_THREADS - 1) / K_SELF_THREADS;
 
     bool has_info = bids.size() == (size_t)num_objs && cids.size() == (size_t)num_objs;
 
     if(grid > 0)
         InfoStacklessBVH_stacklessSelf_kernel<NodeCull, PairPred>
-            <<<grid, K_THREADS, 0, nullptr>>>(num_query,
+            <<<grid, K_SELF_THREADS, 0, nullptr>>>(num_query,
                                               objs,
                                               num_objs - 1,
                                               num_objs,
@@ -1002,14 +1028,14 @@ void InfoStacklessBVH::Impl::stacklessOther(NodeCull node_cull,
 {
     auto num_query = static_cast<int>(query_aabbs.size());
     auto num_objs  = static_cast<int>(ext_aabb.size());
-    auto grid      = (num_query + K_THREADS - 1) / K_THREADS;
+    auto grid      = (num_query + K_OTHER_THREADS - 1) / K_OTHER_THREADS;
 
     bool qhas_info = query_bids.size() == (size_t)num_query
                      && query_cids.size() == (size_t)num_query;
 
     if(grid > 0)
         InfoStacklessBVH_stacklessOther_kernel<NodeCull, PairPred>
-            <<<grid, K_THREADS, 0, nullptr>>>(num_query,
+            <<<grid, K_OTHER_THREADS, 0, nullptr>>>(num_query,
                                               query_aabbs,
                                               query_sorted_id,
                                               num_objs - 1,
