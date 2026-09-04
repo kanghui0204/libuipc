@@ -5,6 +5,18 @@
 
 namespace uipc::backend::cuda
 {
+void launch_fused_pcg_publish_update_direction(
+    cuda_tool::DenseVectorView<Float>  p,
+    cuda_tool::CDenseVectorView<Float> z,
+    cuda_tool::VarView<Float>          rz,
+    cuda_tool::CVarView<Float>         rz_accum,
+    cuda_tool::VarView<Float>          published_rz_new,
+    cuda_tool::VarView<Float>          next_rz_accum,
+    cuda_tool::VarView<Float>          beta,
+    cuda_tool::VarView<IndexT>         converged,
+    cuda_tool::CVarView<Float>         rz_tol,
+    cudaStream_t                       stream);
+
 void launch_fused_pcg_abd_update_apply_dot(
     cuda_tool::CBufferView<Matrix12x12> diag_inv,
     cuda_tool::DenseVectorView<Float>   x,

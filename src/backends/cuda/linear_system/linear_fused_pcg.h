@@ -65,10 +65,13 @@ class LinearFusedPCG : public IterativeSolver
     DeviceDenseVector Ap;
 
     // Block-replay only. The active SpMV clears the opposite slot in-kernel,
-    // removing the per-iteration Ap/pAp clear nodes without changing the
-    // legacy plain or conditional-graph paths.
+    // and the direction kernel clears the opposite residual-dot slot. This
+    // removes all per-iteration clear nodes without changing the legacy plain
+    // or conditional-graph paths.
     std::array<DeviceDenseVector, 2>      m_graph_Ap;
     std::array<cuda_tool::DeviceVar<Float>, 2> m_graph_pAp;
+    std::array<cuda_tool::DeviceVar<Float>, 2> m_graph_rz_accum;
+    cuda_tool::DeviceVar<Float>                m_graph_beta;
 
     cuda_tool::DeviceVar<Float>  d_rz;
     cuda_tool::DeviceVar<Float>  d_pAp;
@@ -88,7 +91,7 @@ class LinearFusedPCG : public IterativeSolver
     IndexT                  m_graph_mode = 0;
     cuda_tool::GraphCapture m_graph;
     // validity key: every device pointer baked into the captured kernels
-    std::array<const void*, 16> m_graph_ptrs{};
+    std::array<const void*, 19> m_graph_ptrs{};
     SizeT                       m_graph_n        = 0;
     SizeT                       m_graph_interval = 0;
     SizeT                       m_graph_max_iter = 0;
