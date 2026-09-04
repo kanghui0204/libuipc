@@ -4,7 +4,7 @@
 #include <cuda_tool/cuda_tool.h>
 #include <Eigen/Dense>
 #include <utils/codim_thickness.h>
-#include <utils/make_spd.h>
+#include <utils/fixed_bank_soa_evd.h>
 #include <utils/matrix_assembler.h>
 
 namespace uipc::backend::cuda
@@ -69,6 +69,7 @@ namespace
         energies(I) = E * Vdt2;
     }
 
+    template <bool GradientOnly>
     __global__ void NeoHookeanShell2D_do_compute_gradient_hessian_kernel(
         cuda_tool::CBufferView<Float>          lambdas,
         cuda_tool::CBufferView<Float>          mus,
@@ -81,7 +82,6 @@ namespace
         cuda_tool::CBufferView<Float>          rest_areas,
         Float                                  dt,
         SizeT                                  half_hessian_size,
-        bool                                   gradient_only,
         int                                    n)
     {
         int I = blockIdx.x * blockDim.x + threadIdx.x;
@@ -109,16 +109,20 @@ namespace
         DoubletVectorAssembler DVA{G3s};
         DVA.segment<StencilSize>(I * StencilSize).write(idx, G);
 
-        if(gradient_only)
-            return;
+        if constexpr(!GradientOnly)
+        {
+            constexpr int SharedLanePitch = 32;
+            __shared__ Float shared_h[9 * 9 * SharedLanePitch];
 
-        Matrix9x9 H;
-        NH::ddEddX(H, lambda, mu, X, IB);
-        make_spd(H);
-        H *= Vdt2;
+            FixedBankSoAMap<9, SharedLanePitch> H(shared_h + threadIdx.x);
+            NH::ddEddX(H, lambda, mu, X, IB);
 
-        TripletMatrixAssembler TMA{H3x3s};
-        TMA.half_block<StencilSize>(I * half_hessian_size).write(idx, H);
+            Vector9 eigen_values;
+            selfadjoint_evd_fixed_bank_shared<9>(H, eigen_values);
+            TripletMatrixAssembler TMA{H3x3s};
+            TMA.half_block<StencilSize>(I * half_hessian_size)
+                .write_psd_from_eigendecomposition(idx, H, eigen_values, Vdt2);
+        }
     }
 }  // namespace
 
@@ -237,10 +241,13 @@ class NeoHookeanShell2D final : public Codim2DConstitution
 
     virtual void do_compute_gradient_hessian(ComputeGradientHessianInfo& info) override
     {
-        auto k = NeoHookeanShell2D_do_compute_gradient_hessian_kernel;
         int  n = (int)info.indices().size();
-        if(n > 0)
+        if(n <= 0)
+            return;
+
+        if(info.gradient_only())
         {
+            auto k = NeoHookeanShell2D_do_compute_gradient_hessian_kernel<true>;
             k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
                 lambdas.cview(),
                 mus.cview(),
@@ -253,7 +260,24 @@ class NeoHookeanShell2D final : public Codim2DConstitution
                 info.rest_areas(),
                 info.dt(),
                 HalfHessianSize,
-                info.gradient_only(),
+                n);
+        }
+        else
+        {
+            constexpr int BlockSize = 32;
+            auto k = NeoHookeanShell2D_do_compute_gradient_hessian_kernel<false>;
+            k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
+                lambdas.cview(),
+                mus.cview(),
+                info.indices(),
+                info.xs(),
+                inv_B_matrices.cview(),
+                info.thicknesses(),
+                info.gradients(),
+                info.hessians(),
+                info.rest_areas(),
+                info.dt(),
+                HalfHessianSize,
                 n);
         }
     }
