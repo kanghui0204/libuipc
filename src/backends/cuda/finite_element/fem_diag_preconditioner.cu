@@ -3,11 +3,13 @@
 #include <linear_system/local_preconditioner.h>
 #include <finite_element/finite_element_method.h>
 #include <linear_system/global_linear_system.h>
+#include <linear_system/fused_pcg_kernels.h>
 #include <finite_element/fem_linear_subsystem.h>
 #include <global_geometry/global_vertex_manager.h>
 #include <kernel_cout.h>
 #include <cuda_tool/cuda_tool.h>
 #include <uipc/geometry/simplicial_complex.h>
+#include <cub/block/block_reduce.cuh>
 
 namespace uipc::backend::cuda
 {
@@ -55,7 +57,92 @@ namespace
             return;
         z.segment<3>(i * 3).as_eigen() = diag_inv(i) * r.segment<3>(i * 3).as_eigen();
     }
+
+    constexpr int FusedPcgBlockSize = 256;
+
+    __global__ void fem_diag_preconditioner_fused_pcg_kernel(
+        cuda_tool::CBufferView<Matrix3x3>  diag_inv,
+        cuda_tool::DenseVectorView<Float>  x,
+        cuda_tool::CDenseVectorView<Float> p,
+        cuda_tool::DenseVectorView<Float>  r,
+        cuda_tool::CDenseVectorView<Float> Ap,
+        cuda_tool::DenseVectorView<Float>  z,
+        cuda_tool::CDense<Float>           rz,
+        cuda_tool::CDense<Float>           pAp,
+        cuda_tool::Dense<Float>            rz_new,
+        cuda_tool::CDense<IndexT>          converged,
+        int                                vertex_count)
+    {
+        using BlockReduce = cub::BlockReduce<Float, FusedPcgBlockSize>;
+        __shared__ typename BlockReduce::TempStorage storage;
+
+        const int  vertex = blockIdx.x * blockDim.x + threadIdx.x;
+        const bool valid  = vertex < vertex_count && *converged == 0;
+        Float      dot    = 0;
+        if(valid)
+        {
+            const Float alpha = *rz / *pAp;
+            Vector3     r_new;
+#pragma unroll
+            for(int component = 0; component < 3; ++component)
+            {
+                const int i = vertex * 3 + component;
+                x(i) += alpha * p(i);
+                r_new(component) = r(i) - alpha * Ap(i);
+                r(i)             = r_new(component);
+            }
+
+            const Vector3 z_new = diag_inv(vertex) * r_new;
+#pragma unroll
+            for(int component = 0; component < 3; ++component)
+                z(vertex * 3 + component) = z_new(component);
+            dot = r_new.dot(z_new);
+        }
+
+        const Float block_dot = BlockReduce(storage).Sum(dot);
+        if(threadIdx.x == 0 && block_dot != Float{0})
+            atomicAdd(rz_new.data(), block_dot);
+    }
 }  // namespace
+
+void launch_fused_pcg_fem_update_apply_dot(
+    cuda_tool::CBufferView<Matrix3x3>  diag_inv,
+    cuda_tool::DenseVectorView<Float>  x,
+    cuda_tool::CDenseVectorView<Float> p,
+    cuda_tool::DenseVectorView<Float>  r,
+    cuda_tool::CDenseVectorView<Float> Ap,
+    cuda_tool::DenseVectorView<Float>  z,
+    cuda_tool::CVarView<Float>         rz,
+    cuda_tool::CVarView<Float>         pAp,
+    cuda_tool::VarView<Float>          rz_new,
+    cuda_tool::CVarView<IndexT>        converged,
+    cudaStream_t                       stream)
+{
+    UIPC_ASSERT(x.size() == diag_inv.size() * 3,
+                "FEM fused PCG segment has {} scalars for {} vertices",
+                x.size(),
+                diag_inv.size());
+
+    const int vertex_count = (int)diag_inv.size();
+    const int grid_size = (vertex_count + FusedPcgBlockSize - 1) / FusedPcgBlockSize;
+    if(grid_size > 0)
+    {
+        fem_diag_preconditioner_fused_pcg_kernel<<<grid_size,
+                                                   FusedPcgBlockSize,
+                                                   0,
+                                                   stream>>>(diag_inv,
+                                                            x,
+                                                            p,
+                                                            r,
+                                                            Ap,
+                                                            z,
+                                                            rz.cviewer(),
+                                                            pAp.cviewer(),
+                                                            rz_new.viewer(),
+                                                            converged.cviewer(),
+                                                            vertex_count);
+    }
+}
 
 class FEMDiagPreconditioner : public LocalPreconditioner
 {
@@ -115,6 +202,23 @@ class FEMDiagPreconditioner : public LocalPreconditioner
             k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, info.stream()>>>(
                 info.r(), info.z(), converged.cviewer(), diag_inv.view(), n);
         }
+    }
+
+    virtual bool do_fused_pcg_update_apply_dot(
+        GlobalLinearSystem::FusedPcgUpdateApplyDotInfo& info) override
+    {
+        launch_fused_pcg_fem_update_apply_dot(diag_inv.cview(),
+                                              info.x(),
+                                              info.p(),
+                                              info.r(),
+                                              info.Ap(),
+                                              info.z(),
+                                              info.rz(),
+                                              info.pAp(),
+                                              info.rz_new(),
+                                              info.converged(),
+                                              info.stream());
+        return true;
     }
 };
 
