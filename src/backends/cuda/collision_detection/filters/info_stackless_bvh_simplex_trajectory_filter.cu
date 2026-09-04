@@ -1429,7 +1429,8 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::detect(DetectInfo& info)
                                  node_pred,
                                  allp_codimp_pred,
                                  candidate_AllP_CodimP_pairs,
-                                 rebuild_query);
+                                 rebuild_query,
+                                 info.reuse_bvh_topology());
     };
     auto launch_codimp_alle = [&](bool rebuild_query)
     {
@@ -1440,7 +1441,8 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::detect(DetectInfo& info)
                             node_pred,
                             codimp_alle_pred,
                             candidate_CodimP_AllE_pairs,
-                            rebuild_query);
+                            rebuild_query,
+                            info.reuse_bvh_topology());
     };
     auto launch_alle_alle = [&]
     {
@@ -1448,8 +1450,15 @@ void InfoStacklessBVHSimplexTrajectoryFilter::Impl::detect(DetectInfo& info)
     };
     auto launch_allp_allt = [&](bool rebuild_query)
     {
-        lbvh_T.launch_query(
-            point_aabbs, point_bids, point_cids, cmts, node_pred, allp_allt_pred, candidate_AllP_AllT_pairs, rebuild_query);
+        lbvh_T.launch_query(point_aabbs,
+                            point_bids,
+                            point_cids,
+                            cmts,
+                            node_pred,
+                            allp_allt_pred,
+                            candidate_AllP_AllT_pairs,
+                            rebuild_query,
+                            info.reuse_bvh_topology());
     };
 
     if(codimVs.size() > 0)

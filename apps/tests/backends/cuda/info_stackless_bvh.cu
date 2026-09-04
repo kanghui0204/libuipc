@@ -814,6 +814,38 @@ std::vector<Vector2i> refit_query_pairs(InfoStacklessBVH&       bvh,
     return result;
 }
 
+std::vector<Vector2i> refit_query_pairs(
+    InfoStacklessBVH&              bvh,
+    CBufferView<AABB>              query_aabbs,
+    CBufferView<IndexT>            query_bids,
+    CBufferView<IndexT>            query_cids,
+    CBuffer2DView<IndexT>          cmts,
+    InfoStacklessBVH::QueryBuffer& pairs,
+    bool                           reuse_query_order)
+{
+    bvh.query(query_aabbs,
+              query_bids,
+              query_cids,
+              cmts,
+              RefitNodePred{cmts.viewer()},
+              RefitLeafPred{cmts.viewer()},
+              pairs,
+              reuse_query_order);
+
+    std::vector<Vector2i> result(pairs.size());
+    if(!result.empty())
+        pairs.view().copy_to(result.data());
+    return result;
+}
+
+std::vector<int> copy_query_order(const InfoStacklessBVH::QueryBuffer& pairs)
+{
+    std::vector<int> result(pairs.m_querySortedId.size());
+    if(!result.empty())
+        pairs.m_querySortedId.view().copy_to(result.data());
+    return result;
+}
+
 size_t check_refit_pairs(std::vector<Vector2i> refitted,
                          std::vector<Vector2i> rebuilt)
 {
@@ -1007,6 +1039,95 @@ void run_refit_cases()
         CHECK(mixed_self > 1);
         CHECK(mixed_other > 1);
     }
+}
+
+void run_query_order_reuse_cases()
+{
+    constexpr IndexT cid_count = 4;
+    std::vector<IndexT> cmts(cid_count * cid_count);
+    for(IndexT i = 0; i < cid_count; ++i)
+        for(IndexT j = 0; j < cid_count; ++j)
+            cmts[i * cid_count + j] = ((i + j) % 3) != 0;
+    DeviceBuffer2D<IndexT> d_cmts(Extent2D{cid_count, cid_count});
+    d_cmts.view().copy_from(cmts.data());
+
+    auto target = refit_swept_inputs(96, 0.0);
+    DeviceBuffer<AABB>   target_aabbs;
+    DeviceBuffer<IndexT> target_bids;
+    DeviceBuffer<IndexT> target_cids;
+    upload_refit(target, target_aabbs, target_bids, target_cids);
+    InfoStacklessBVH bvh;
+    bvh.build(target_aabbs, target_bids, target_cids);
+
+    DeviceBuffer<AABB>   query_aabbs;
+    DeviceBuffer<IndexT> query_bids;
+    DeviceBuffer<IndexT> query_cids;
+    InfoStacklessBVH::QueryBuffer reused;
+    reused.m_pairs.release();
+    reused.reserve(1);
+
+    // Prime a Morton permutation, then move the same query IDs into reverse
+    // spatial order. Reuse must keep the permutation while predicates still
+    // see current boxes and produce the same exact pairs as a fresh sort.
+    upload_refit(refit_initial_inputs(33), query_aabbs, query_bids, query_cids);
+    refit_query_pairs(bvh,
+                      query_aabbs,
+                      query_bids,
+                      query_cids,
+                      d_cmts.view(),
+                      reused,
+                      false);
+    auto initial_order = copy_query_order(reused);
+
+    upload_refit(
+        refit_swept_inputs(33, 0.04), query_aabbs, query_bids, query_cids);
+    auto reused_pairs = refit_query_pairs(bvh,
+                                          query_aabbs,
+                                          query_bids,
+                                          query_cids,
+                                          d_cmts.view(),
+                                          reused,
+                                          true);
+    CHECK(copy_query_order(reused) == initial_order);
+
+    InfoStacklessBVH::QueryBuffer fresh;
+    fresh.m_pairs.release();
+    fresh.reserve(1);
+    auto fresh_pairs = refit_query_pairs(bvh,
+                                         query_aabbs,
+                                         query_bids,
+                                         query_cids,
+                                         d_cmts.view(),
+                                         fresh,
+                                         false);
+    auto fresh_order = copy_query_order(fresh);
+    CHECK(initial_order != fresh_order);
+    CHECK(check_refit_pairs(std::move(reused_pairs), std::move(fresh_pairs)) > 1);
+
+    // A count change cannot reuse the old permutation and must rebuild it.
+    upload_refit(
+        refit_swept_inputs(34, 0.02), query_aabbs, query_bids, query_cids);
+    auto changed_reused = refit_query_pairs(bvh,
+                                            query_aabbs,
+                                            query_bids,
+                                            query_cids,
+                                            d_cmts.view(),
+                                            reused,
+                                            true);
+    InfoStacklessBVH::QueryBuffer changed_fresh;
+    changed_fresh.m_pairs.release();
+    changed_fresh.reserve(1);
+    auto changed_fresh_pairs = refit_query_pairs(bvh,
+                                                 query_aabbs,
+                                                 query_bids,
+                                                 query_cids,
+                                                 d_cmts.view(),
+                                                 changed_fresh,
+                                                 false);
+    CHECK(copy_query_order(reused) == copy_query_order(changed_fresh));
+    CHECK(check_refit_pairs(std::move(changed_reused),
+                            std::move(changed_fresh_pairs))
+          > 1);
 }
 
 void run_internal_cull_rate_case()
@@ -1317,4 +1438,11 @@ TEST_CASE("info_stackless_bvh topology refit",
 {
     using namespace test_info_stackless_bvh;
     run_refit_cases();
+}
+
+TEST_CASE("info_stackless_bvh query Morton order reuse",
+          "[collision detection][bvh_query_order][line_search]")
+{
+    using namespace test_info_stackless_bvh;
+    run_query_order_reuse_cases();
 }

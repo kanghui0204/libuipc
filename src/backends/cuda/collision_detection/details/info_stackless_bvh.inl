@@ -1186,8 +1186,15 @@ inline InfoStacklessBVH::InfoStacklessBVH(cuda_tool::Stream& stream) noexcept
     (void)stream;
 }
 
-inline void InfoStacklessBVH::QueryBuffer::build(cuda_tool::CBufferView<AABB> aabbs)
+inline void InfoStacklessBVH::QueryBuffer::build(cuda_tool::CBufferView<AABB> aabbs,
+                                                 bool reuse_order)
 {
+    // Morton order schedules traversal only; pair predicates still consume
+    // current AABBs and primitive IDs. During one Line Search the query
+    // identity and count are stable, so a cached permutation remains valid.
+    if(reuse_order && m_querySortedId.size() == aabbs.size())
+        return;
+
     m_queryMtCode.resize(aabbs.size());
     m_querySortedMtCode.resize(aabbs.size());
     m_queryId.resize(aabbs.size());
@@ -1309,7 +1316,8 @@ inline void InfoStacklessBVH::launch_query(cuda_tool::CBufferView<AABB> query_aa
                                            NodePred     np,
                                            LeafPred     lp,
                                            QueryBuffer& qbuffer,
-                                           bool         rebuild_query)
+                                           bool         rebuild_query,
+                                           bool         reuse_query_order)
 {
     using namespace cuda_tool;
     BufferLaunch().fill(qbuffer.m_cpNum.view(), 0);
@@ -1327,7 +1335,7 @@ inline void InfoStacklessBVH::launch_query(cuda_tool::CBufferView<AABB> query_aa
                 query_CIDs.size());
 
     if(rebuild_query)
-        qbuffer.build(query_aabbs);
+        qbuffer.build(query_aabbs, reuse_query_order);
     m_impl.stacklessOther(np,
                           lp,
                           query_aabbs,
@@ -1346,12 +1354,29 @@ inline void InfoStacklessBVH::query(cuda_tool::CBufferView<AABB>   query_aabbs,
                                     cuda_tool::CBuffer2DView<IndexT> cmts,
                                     NodePred                         np,
                                     LeafPred                         lp,
-                                    QueryBuffer&                     qbuffer)
+                                    QueryBuffer&                     qbuffer,
+                                    bool                             reuse_query_order)
 {
-    launch_query(query_aabbs, query_BIDs, query_CIDs, cmts, np, lp, qbuffer, true);
+    launch_query(query_aabbs,
+                 query_BIDs,
+                 query_CIDs,
+                 cmts,
+                 np,
+                 lp,
+                 qbuffer,
+                 true,
+                 reuse_query_order);
     int h_cp_num = qbuffer.m_cpNum;
     if(prepare_query_result(qbuffer, h_cp_num))
-        launch_query(query_aabbs, query_BIDs, query_CIDs, cmts, np, lp, qbuffer, false);
+        launch_query(query_aabbs,
+                     query_BIDs,
+                     query_CIDs,
+                     cmts,
+                     np,
+                     lp,
+                     qbuffer,
+                     false,
+                     reuse_query_order);
 }
 
 }  // namespace uipc::backend::cuda
