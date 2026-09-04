@@ -356,6 +356,33 @@ class TripletMatrixAssembler
             }
         }
 
+        // Write directly from an Eigen expression/map.  This is useful for
+        // matrices backed by per-lane shared memory: binding such a map to the
+        // BlockMatrix overload above first materializes the entire matrix in a
+        // thread-local temporary and defeats the shared-workspace layout.
+        template <typename Derived>
+        UIPC_GENERIC void write_expression(
+            const Eigen::Vector<IndexT, N>& indices,
+            const Eigen::MatrixBase<Derived>& value)
+        {
+            static_assert(Derived::RowsAtCompileTime == N * BlockDim);
+            static_assert(Derived::ColsAtCompileTime == N * BlockDim);
+
+            IndexT offset = m_I;
+            for(IndexT ii = 0; ii < N; ++ii)
+            {
+                for(IndexT jj = ii; jj < N; ++jj)
+                {
+                    auto [L, R] = upper_LR(indices, ii, jj);
+                    ElementMatrix H = value.derived()
+                                          .template block<BlockDim, BlockDim>(
+                                              L * BlockDim, R * BlockDim);
+                    m_assembler.m_triplet(offset++).write(
+                        indices(L), indices(R), H);
+                }
+            }
+        }
+
         // Reconstruct one PSD block at a time from V*diag(lambda)*V^T and
         // immediately write it. This keeps the eigenvectors intact while
         // avoiding a second full local/shared Hessian.
