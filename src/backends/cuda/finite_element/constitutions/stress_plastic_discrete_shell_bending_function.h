@@ -354,5 +354,48 @@ namespace sym::stress_plastic_discrete_shell_bending
 
         H = dthetadx * ddEddtheta * dthetadx.transpose() + dEdtheta * ddthetaddx;
     }
+
+    template <typename Hessian>
+    inline UIPC_GENERIC void d2Edx2(Vector12&      G,
+                                    Hessian&       H,
+                                    const Vector3& x0,
+                                    const Vector3& x1,
+                                    const Vector3& x2,
+                                    const Vector3& x3,
+                                    Float          L0,
+                                    Float          h_bar,
+                                    Float          theta_bar,
+                                    Float          kappa,
+                                    Float          yield_stress)
+    {
+        Float theta = 0.0;
+        Float delta = 0.0;
+        if(!try_angle_delta(x0, x1, x2, x3, theta_bar, theta, delta))
+        {
+            G.setZero();
+            H.setZero();
+            return;
+        }
+
+        Float energy     = 0.0;
+        Float dEdtheta   = 0.0;
+        Float ddEddtheta = 0.0;
+        if(!augmented_response_from_angle_delta(
+               delta, kappa, L0, h_bar, yield_stress, energy, dEdtheta, ddEddtheta))
+        {
+            G.setZero();
+            H.setZero();
+            return;
+        }
+
+        Vector12 dthetadx;
+        dihedral_angle_gradient(x0, x1, x2, x3, dthetadx);
+        G = dEdtheta * dthetadx;
+
+        Matrix12x12 ddthetaddx;
+        dihedral_angle_hessian(x0, x1, x2, x3, ddthetaddx);
+        H = dthetadx * ddEddtheta * dthetadx.transpose()
+            + dEdtheta * ddthetaddx;
+    }
 }  // namespace sym::stress_plastic_discrete_shell_bending
 }  // namespace uipc::backend::cuda

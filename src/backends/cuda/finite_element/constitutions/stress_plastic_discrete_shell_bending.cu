@@ -112,23 +112,40 @@ namespace
 
         Float Vdt2 = V_bar * dt * dt;
 
-        Vector12 G12;
-
-        SPDSB::dEdx(G12, x0, x1, x2, x3, L0, h_bar, theta_bar, kappa, yield_stress);
-        G12 *= Vdt2;
-        DoubletVectorAssembler DVA{G3s};
-        DVA.segment<StencilSize>(I * StencilSize).write(stencil, G12);
-
         if constexpr(GradientOnly)
-            return;
+        {
+            Vector12 G12;
+            SPDSB::dEdx(
+                G12, x0, x1, x2, x3, L0, h_bar, theta_bar, kappa, yield_stress);
+            G12 *= Vdt2;
+            DoubletVectorAssembler DVA{G3s};
+            DVA.segment<StencilSize>(I * StencilSize).write(stencil, G12);
+        }
+        else
+        {
+            Vector12    G12;
+            Matrix12x12 H12x12;
+            SPDSB::d2Edx2(G12,
+                          H12x12,
+                          x0,
+                          x1,
+                          x2,
+                          x3,
+                          L0,
+                          h_bar,
+                          theta_bar,
+                          kappa,
+                          yield_stress);
 
-        Matrix12x12 H12x12;
-        SPDSB::ddEddx(H12x12, x0, x1, x2, x3, L0, h_bar, theta_bar, kappa, yield_stress);
-        H12x12 *= Vdt2;
-        make_spd(H12x12);
+            G12 *= Vdt2;
+            DoubletVectorAssembler DVA{G3s};
+            DVA.segment<StencilSize>(I * StencilSize).write(stencil, G12);
 
-        TripletMatrixAssembler TMA{H3x3s};
-        TMA.half_block<StencilSize>(I * HalfHessianSize).write(stencil, H12x12);
+            H12x12 *= Vdt2;
+            make_spd(H12x12);
+            TripletMatrixAssembler TMA{H3x3s};
+            TMA.half_block<StencilSize>(I * HalfHessianSize).write(stencil, H12x12);
+        }
     }
 
     __global__ void StressPlasticDiscreteShellBendingTimeIntegrator_do_update_state_kernel(
