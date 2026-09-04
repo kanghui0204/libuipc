@@ -256,13 +256,19 @@ class DeviceRadixSort
         return *this;
     }
     template <typename K, typename V>
-    DeviceRadixSort& SortPairs(const K* kin, K* kout, const V* vin, V* vout, int n)
+    DeviceRadixSort& SortPairs(const K* kin,
+                               K*       kout,
+                               const V* vin,
+                               V*       vout,
+                               int      n,
+                               int      begin_bit = 0,
+                               int      end_bit   = sizeof(K) * 8)
     {
         details::run_with_temp_storage(
             [&](void* t, size_t& b, cudaStream_t s)
             {
                 cub::DeviceRadixSort::SortPairs(
-                    t, b, kin, kout, vin, vout, n, 0, sizeof(K) * 8, s);
+                    t, b, kin, kout, vin, vout, n, begin_bit, end_bit, s);
             },
             m_stream);
         return *this;
