@@ -58,7 +58,7 @@ namespace
         z.segment<3>(i * 3).as_eigen() = diag_inv(i) * r.segment<3>(i * 3).as_eigen();
     }
 
-    constexpr int FusedPcgBlockSize = 256;
+    constexpr int FusedPcgBlockSize = 32;
 
     __global__ void fem_diag_preconditioner_fused_pcg_kernel(
         cuda_tool::CBufferView<Matrix3x3>  diag_inv,
