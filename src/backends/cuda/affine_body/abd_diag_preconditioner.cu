@@ -50,7 +50,7 @@ namespace
         int                                 body_count)
     {
         constexpr int WarpSize      = 32;
-        constexpr int WarpsPerBlock = 256 / WarpSize;
+        constexpr int WarpsPerBlock = 32 / WarpSize;
         __shared__ Float body_dots[WarpsPerBlock];
 
         const int lane          = threadIdx.x & (WarpSize - 1);
@@ -118,12 +118,12 @@ void launch_fused_pcg_abd_update_apply_dot(
                 x.size(),
                 diag_inv.size());
 
-    constexpr int WarpsPerBlock = 8;
+    constexpr int WarpsPerBlock = 1;
     const int     body_count     = (int)diag_inv.size();
     const int grid_size = (body_count + WarpsPerBlock - 1) / WarpsPerBlock;
     if(grid_size > 0)
     {
-        abd_diag_preconditioner_fused_pcg_kernel<<<grid_size, 256, 0, stream>>>(
+        abd_diag_preconditioner_fused_pcg_kernel<<<grid_size, 32, 0, stream>>>(
             diag_inv,
             x,
             p,

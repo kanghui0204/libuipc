@@ -38,6 +38,11 @@ struct Flags
 
 namespace
 {
+    constexpr int RbkSymSpmvDotBlockDim = 32;
+    static_assert(RbkSymSpmvDotBlockDim >= 32);
+    static_assert(RbkSymSpmvDotBlockDim <= 1024);
+    static_assert(RbkSymSpmvDotBlockDim % 32 == 0);
+
     // y = b * y, shared by sym_spmv / rbk_spmv / rbk_sym_spmv / rbk_sym_spmv_dot
     __global__ void Spmv_scale_y_kernel(Float b, cuda_tool::DenseVectorView<Float> y, int n)
     {
@@ -377,7 +382,7 @@ namespace
         // valid when the matrix nnz changes within the reserved capacity
         const int     triplet_count = (int)(*d_triplet_count);
         constexpr int warp_size     = 32;
-        constexpr int block_dim     = 256;
+        constexpr int block_dim     = RbkSymSpmvDotBlockDim;
         constexpr int N             = 3;
         using T                     = Float;
 
@@ -466,22 +471,8 @@ namespace
 
         dot_local = WarpReduceFloat(temp_storage_float[warp_id]).Sum(dot_local);
 
-        // two-level reduction: one atomicAdd per BLOCK, not per warp —
-        // ~9k same-address atomic doubles serialized ~20-30us per call
-        __shared__ Float s_dot_partials[block_dim / warp_size];
-        if(lane_id == 0)
-            s_dot_partials[warp_id] = dot_local;
-        __syncthreads();
-        if(thread_id_in_block < warp_size)
-        {
-            Float partial = (thread_id_in_block < block_dim / warp_size) ?
-                                s_dot_partials[thread_id_in_block] :
-                                Float{0};
-            __syncwarp();
-            partial = WarpReduceFloat(temp_storage_float[0]).Sum(partial);
-            if(thread_id_in_block == 0)
-                atomicAdd(d_dot.data(), partial);
-        }
+        if(lane_id == 0 && dot_local != Float{0})
+            atomicAdd(d_dot.data(), dot_local);
     }
 }  // namespace
 
@@ -602,7 +593,7 @@ void Spmv::rbk_sym_spmv_dot(Float                                a,
     // grid covers the reserved capacity: blocks beyond the current
     // (device-side) count exit through the is_valid guard with zero work,
     // so the launch shape need not change when the count does
-    constexpr int block_dim = 256;
+    constexpr int block_dim = RbkSymSpmvDotBlockDim;
     int block_count = (int)((triplet_capacity + block_dim - 1) / block_dim);
 
     if(block_count > 0)
@@ -634,7 +625,7 @@ void Spmv::rbk_sym_spmv_dot_pipelined(
     SizeT                                triplet_capacity,
     cudaStream_t                         stream)
 {
-    constexpr int block_dim = 256;
+    constexpr int block_dim = RbkSymSpmvDotBlockDim;
     int block_count = (int)((triplet_capacity + block_dim - 1) / block_dim);
 
     // Keep the clear contract valid for an empty-capacity matrix as well.
