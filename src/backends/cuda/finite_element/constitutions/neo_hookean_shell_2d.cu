@@ -221,7 +221,7 @@ class NeoHookeanShell2D final : public Codim2DConstitution
         int  n = (int)info.indices().size();
         if(n > 0)
         {
-            constexpr int energy_threads = 128;
+            constexpr int energy_threads = 64;
             k<<<(n + energy_threads - 1) / energy_threads,
                  energy_threads,
                  0,
