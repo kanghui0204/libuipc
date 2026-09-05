@@ -3,6 +3,7 @@
 #include <contact_system/contact_models/ipc_simplex_frictional_contact_energy.h>
 #include <utils/codim_thickness.h>
 #include <utils/fixed_bank_soa_evd.h>
+#include <utils/contact_type_block_layout.h>
 #include <kernel_cout.h>
 #include <utils/matrix_assembler.h>
 #include <utils/primitive_d_hat.h>
@@ -322,18 +323,19 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
         using namespace cuda_tool;
         using namespace sym::codim_ipc_contact;
 
-        auto pt_count = (IndexT)info.friction_PTs().size();
-        auto ee_count = (IndexT)info.friction_EEs().size();
-        auto pe_count = (IndexT)info.friction_PEs().size();
-        auto pp_count = (IndexT)info.friction_PPs().size();
-        auto total    = pt_count + ee_count + pe_count + pp_count;
+        const auto layout = make_contact_type_contiguous_layout<IndexT>(
+            info.friction_PTs().size(),
+            info.friction_EEs().size(),
+            info.friction_PEs().size(),
+            info.friction_PPs().size());
+        const IndexT total = layout.pp_end;
 
         if(total == 0)
             return;
 
-        IndexT ee_offset = pt_count;
-        IndexT pe_offset = ee_offset + ee_count;
-        IndexT pp_offset = pe_offset + pe_count;
+        const IndexT ee_offset = layout.pt_end;
+        const IndexT pe_offset = layout.ee_end;
+        const IndexT pp_offset = layout.pe_end;
 
         // Keep all contact types in one launch so rare, expensive PT/EE work
         // overlaps the dominant PE population. Specialize only the uniform
@@ -344,7 +346,8 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
             const int block_size = GradientOnly ? cuda_tool::best_block_dim(k) : 12;
             const int grid_size  = GradientOnly ?
                                        cuda_tool::best_grid_dim(total, k) :
-                                       (total + block_size - 1) / block_size;
+                                       total / block_size
+                                           + (total % block_size != 0);
             k<<<grid_size, block_size, 0, nullptr>>>(
                 info.contact_tabular().viewer(),
                 info.contact_element_ids().viewer(),
