@@ -3,6 +3,7 @@
 #include <contact_system/contact_models/codim_ipc_simplex_frictional_contact_function.h>
 #include <utils/codim_thickness.h>
 #include <utils/primitive_d_hat.h>
+#include <utils/contact_type_block_layout.h>
 
 namespace uipc::backend::cuda
 {
@@ -190,16 +191,18 @@ namespace
 void launch_ipc_simplex_frictional_contact_energy(
     const IPCSimplexFrictionalContactEnergyLaunchInfo& info)
 {
-    const IndexT pt_end = static_cast<IndexT>(info.PTs.size());
-    const IndexT ee_end = pt_end + static_cast<IndexT>(info.EEs.size());
-    const IndexT pe_end = ee_end + static_cast<IndexT>(info.PEs.size());
-    const IndexT pp_end = pe_end + static_cast<IndexT>(info.PPs.size());
+    const auto layout = make_contact_type_contiguous_layout<IndexT>(
+        info.PTs.size(), info.EEs.size(), info.PEs.size(), info.PPs.size());
+    const IndexT pt_end = layout.pt_end;
+    const IndexT ee_end = layout.ee_end;
+    const IndexT pe_end = layout.pe_end;
+    const IndexT pp_end = layout.pp_end;
     if(pp_end == 0)
         return;
 
     constexpr int BlockSize = 64;
     ipc_simplex_frictional_contact_energy_kernel<<<
-        (pp_end + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
+        pp_end / BlockSize + (pp_end % BlockSize != 0), BlockSize, 0, nullptr>>>(
         info.contact_tabular.viewer(),
         info.contact_element_ids,
         info.positions,
