@@ -2,12 +2,12 @@
 #include <cuda_tool/cub.h>
 #include <cuda_tool/cuda_tool.h>
 
-// Implementation of InfoStacklessBVH.
-// All build/sort/reorder functions are identical to InfoStacklessBVH.
-// The two traversal functions (stacklessSelf / stacklessOther) are the
-// optimized variants: they pre-load per-query bid/cid into shared memory
-// ONCE before the traversal loop, eliminating repeated global-memory reads
-// of query_bid/query_cid inside the hot node-cull path.
+// Optimized InfoStacklessBVH implementation. Self/Other traversal pre-loads
+// per-query bid/cid into shared memory, and Self also skips subtrees that
+// cannot pass the Morton-rank uniqueness rule. The build path keeps enough
+// topology metadata for later refits, while compatible Other queries may
+// reuse their Morton order; both optimizations fall back to a full build when
+// their cached topology or ordering is no longer valid.
 
 namespace uipc::info_stackless_detail
 {
@@ -836,7 +836,7 @@ namespace
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Build pipeline — identical to InfoStacklessBVH
+// Build and refit pipeline
 // ---------------------------------------------------------------------------
 
 inline void InfoStacklessBVH::Impl::calcMaxBVFromBox(cuda_tool::CBufferView<AABB> aabbs,
