@@ -14,6 +14,9 @@ namespace uipc::backend::cuda_tool
 // function-pointer type (same signature), so keying by the template
 // parameter would let one kernel's block size leak into another's.
 template <typename Kernel>
+#if defined(__ELF__)
+[[gnu::visibility("hidden")]]
+#endif
 int best_block_dim(Kernel kernel, size_t shared_mem_size = 0)
 {
     static thread_local std::unordered_map<const void*, int> cached_block_sizes;
@@ -32,6 +35,9 @@ int best_block_dim(Kernel kernel, size_t shared_mem_size = 0)
 
 // grid dim for launching `kernel` over n items with best_block_dim(kernel)
 template <typename Kernel>
+#if defined(__ELF__)
+[[gnu::visibility("hidden")]]
+#endif
 int best_grid_dim(int n, Kernel kernel, size_t shared_mem_size = 0)
 {
     int bd = best_block_dim(kernel, shared_mem_size);
