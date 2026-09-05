@@ -58,6 +58,9 @@ class IterativeSolver : public SimSystem
                               cudaStream_t stream = nullptr);
     // data pointers of the assembled system matrix (FusedPCG graph key)
     std::array<const void*, 3> matrix_data_ptrs() const;
+    // Generation of the per-subsystem DoF layout captured by fused-PCG
+    // subviews and local-preconditioner kernels.
+    SizeT linear_system_layout_generation() const;
     bool accuracy_statisfied(cuda_tool::DenseVectorView<Float> r);
     cuda_tool::LinearSystemContext& ctx() const;
 

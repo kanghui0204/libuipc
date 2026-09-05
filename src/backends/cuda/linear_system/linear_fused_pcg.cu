@@ -617,14 +617,16 @@ void LinearFusedPCG::run_graph_iteration(cuda_tool::DenseVectorView<Float> x,
 void LinearFusedPCG::destroy_graph()
 {
     m_graph.reset_graph();
-    m_graph_n = 0;
+    m_graph_n                 = 0;
+    m_graph_layout_generation = 0;
 }
 
 #if CUDA_TOOL_GRAPH_WHILE
 void LinearFusedPCG::destroy_while()
 {
     m_while.reset_graph();
-    m_while_n = 0;
+    m_while_n                 = 0;
+    m_while_layout_generation = 0;
 }
 
 bool LinearFusedPCG::while_key_matches(cuda_tool::DenseVectorView<Float>  x,
@@ -646,7 +648,9 @@ bool LinearFusedPCG::while_key_matches(cuda_tool::DenseVectorView<Float>  x,
                                         d_rz.data(),
                                         d_rz_new.data(),
                                         d_pAp.data()};
-    return m_while_n == x.size() && m_while_max_iter == max_iter && m_while_ptrs == ptrs;
+    return m_while_n == x.size() && m_while_max_iter == max_iter
+           && m_while_layout_generation == linear_system_layout_generation()
+           && m_while_ptrs == ptrs;
 }
 
 void LinearFusedPCG::rebuild_while(cuda_tool::DenseVectorView<Float>  x,
@@ -705,6 +709,7 @@ void LinearFusedPCG::rebuild_while(cuda_tool::DenseVectorView<Float>  x,
                         d_pAp.data()};
     m_while_n        = x.size();
     m_while_max_iter = max_iter;
+    m_while_layout_generation = linear_system_layout_generation();
     logger::info("LinearFusedPCG: captured full-GPU while-loop graph (n = {})", x.size());
 }
 #endif
@@ -737,7 +742,9 @@ bool LinearFusedPCG::graph_key_matches(cuda_tool::DenseVectorView<Float>  x,
                                         m_graph_rz_accum[1].data(),
                                         m_graph_beta.data()};
     return m_graph_n == x.size() && m_graph_interval == interval
-           && m_graph_max_iter == max_iter && m_graph_ptrs == ptrs;
+           && m_graph_max_iter == max_iter
+           && m_graph_layout_generation == linear_system_layout_generation()
+           && m_graph_ptrs == ptrs;
 }
 
 void LinearFusedPCG::rebuild_graph(cuda_tool::DenseVectorView<Float>  x,
@@ -752,7 +759,7 @@ void LinearFusedPCG::rebuild_graph(cuda_tool::DenseVectorView<Float>  x,
         [&](cudaStream_t capture_stream)
         {
             // Every replay starts at slot 0. This prefix keeps odd intervals
-            // correct; for the fixed production interval 50 it is a cheap
+            // correct; for an even configured interval it is a cheap
             // once-per-block redundant clear, not a per-iteration node.
             cuda_tool::BufferLaunch(capture_stream)
                 .fill<Float>(m_graph_Ap[0].buffer_view(), 0);
@@ -802,6 +809,7 @@ void LinearFusedPCG::rebuild_graph(cuda_tool::DenseVectorView<Float>  x,
     m_graph_n        = x.size();
     m_graph_interval = interval;
     m_graph_max_iter = max_iter;
+    m_graph_layout_generation = linear_system_layout_generation();
 }
 
 SizeT LinearFusedPCG::fused_pcg(cuda_tool::DenseVectorView<Float>  x,

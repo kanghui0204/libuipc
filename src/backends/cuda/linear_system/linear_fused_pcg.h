@@ -92,6 +92,7 @@ class LinearFusedPCG : public IterativeSolver
     SizeT                       m_graph_n        = 0;
     SizeT                       m_graph_interval = 0;
     SizeT                       m_graph_max_iter = 0;
+    SizeT                       m_graph_layout_generation = 0;
 
     // --- full-GPU while-loop graph (CUDA >= 12.4) ---
     cuda_tool::GraphWhile        m_while;
@@ -99,6 +100,7 @@ class LinearFusedPCG : public IterativeSolver
     std::array<const void*, 12>  m_while_ptrs{};
     SizeT                        m_while_n        = 0;
     SizeT                        m_while_max_iter = 0;
+    SizeT                        m_while_layout_generation = 0;
     bool while_key_matches(cuda_tool::DenseVectorView<Float>  x,
                            cuda_tool::CDenseVectorView<Float> b,
                            SizeT                              max_iter) const;

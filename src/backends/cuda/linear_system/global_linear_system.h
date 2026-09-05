@@ -354,6 +354,11 @@ class GlobalLinearSystem : public SimSystem
         bool  initialized           = false;
         bool  empty_system          = true;
         SizeT last_solve_iterations = 0;
+        // Changes whenever the per-subsystem DoF partition changes. CUDA
+        // graphs capture subview offsets/counts and local-preconditioner
+        // buffer pointers, so total DoF and global matrix pointers alone are
+        // not a sufficient graph validity key.
+        SizeT dof_layout_generation = 0;
 
         void apply_preconditioner(cuda_tool::DenseVectorView<Float>  z,
                                   cuda_tool::CDenseVectorView<Float> r,
