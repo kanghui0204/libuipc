@@ -1,6 +1,7 @@
 #pragma once
 
 #include <uipc/common/log.h>
+#include <uipc/common/type_define.h>
 
 #include <cstdint>
 #include <limits>
@@ -19,6 +20,49 @@ struct ContactTypeBlockLayout
     Index pp_offset;
     Index padded_total;
 };
+
+template <typename Index>
+struct ContactTypeContiguousLayout
+{
+    Index pt_end;
+    Index ee_end;
+    Index pe_end;
+    Index pp_end;
+};
+
+// Build the prefix ends used by a fused PT/EE/PE/PP kernel without narrowing
+// any individual count or overflowing the signed device index type.
+template <typename Index>
+inline ContactTypeContiguousLayout<Index> make_contact_type_contiguous_layout(
+    SizeT pt_count,
+    SizeT ee_count,
+    SizeT pe_count,
+    SizeT pp_count)
+{
+    static_assert(std::is_integral_v<Index> && std::is_signed_v<Index>);
+
+    constexpr SizeT IndexMax =
+        static_cast<SizeT>(std::numeric_limits<Index>::max());
+    SizeT total = 0;
+    auto  append = [&](SizeT count)
+    {
+        UIPC_ASSERT_THROW(count <= IndexMax - total,
+                          "Fused contact count exceeds index limit {}: "
+                          "prefix={}, next={}",
+                          IndexMax,
+                          total,
+                          count);
+        total += count;
+        return static_cast<Index>(total);
+    };
+
+    ContactTypeContiguousLayout<Index> layout{};
+    layout.pt_end = append(pt_count);
+    layout.ee_end = append(ee_count);
+    layout.pe_end = append(pe_count);
+    layout.pp_end = append(pp_count);
+    return layout;
+}
 
 template <int BlockSize, typename Index>
 inline ContactTypeBlockLayout<Index> make_contact_type_block_layout(
