@@ -1,7 +1,9 @@
 #include <app/app.h>
 #include <cuda_tool/cuda_tool.h>
+#include <finite_element/constitutions/neo_hookean_shell_2d_energy.h>
 #include <finite_element/constitutions/neo_hookean_shell_2d_function.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <vector>
@@ -14,48 +16,102 @@ namespace
 {
 namespace NH = sym::neo_hookean_shell_2d;
 
-__device__ Float sample_energy(int I)
+template <typename T>
+void copy_to_device(DeviceBuffer<T>& device, const std::vector<T>& host)
 {
-    const Float s = Float(I % 17) * Float{1.0e-4};
-    Vector9     X;
-    X << Float{0.0}, Float{0.0}, Float{0.0}, Float{1.0} + s, Float{0.02},
-        Float{0.0}, Float{0.01}, Float{1.0} - s, Float{0.0};
-
-    Matrix2x2 IB = Matrix2x2::Identity();
-    Float     E;
-    NH::E(E, Float{2.0} + s, Float{3.0} - s, X, IB);
-    return E;
+    device.resize(host.size());
+    if(!host.empty())
+        device.view().copy_from(host.data());
 }
 
-__global__ void sample_energy_kernel(BufferView<Float> output, int n)
+void check_production_energy_launcher(int count)
 {
-    int I = blockIdx.x * blockDim.x + threadIdx.x;
-    if(I < n)
-        output(I) = sample_energy(I);
-}
+    constexpr Float Dt = Float{0.125};
 
-void compare_default_and_cta128(int count)
-{
-    DeviceBuffer<Float> default_energy(count);
-    DeviceBuffer<Float> cta128_energy(count);
-    auto                kernel = sample_energy_kernel;
-    kernel<<<best_grid_dim(count, kernel), best_block_dim(kernel), 0, nullptr>>>(
-        default_energy.view(), count);
-    kernel<<<(count + 127) / 128, 128, 0, nullptr>>>(cta128_energy.view(), count);
+    std::vector<Float>     lambdas(count);
+    std::vector<Float>     mus(count);
+    std::vector<Float>     rest_areas(count);
+    std::vector<Float>     thicknesses(3 * count);
+    std::vector<Vector3i>  indices(count);
+    std::vector<Vector3>   positions(3 * count);
+    std::vector<Matrix2x2> inverse_rest_shape_matrices(count);
+    std::vector<Float>     expected(count);
 
-    std::vector<Float> default_host;
-    std::vector<Float> cta128_host;
-    default_energy.copy_to(default_host);
-    cta128_energy.copy_to(cta128_host);
-    REQUIRE(default_host == cta128_host);
-    for(Float E : cta128_host)
-        REQUIRE(std::isfinite(E));
+    for(int i = 0; i < count; ++i)
+    {
+        const int   vertex_begin = 3 * i;
+        const Float s            = Float(i % 17) * Float{1.0e-4};
+        const Float thickness    = Float{0.02} + Float(i % 5) * Float{1.0e-3};
+
+        lambdas[i]    = Float{2.0} + s;
+        mus[i]        = Float{3.0} - s;
+        rest_areas[i] = Float{0.5} + Float(i % 7) * Float{0.01};
+        indices[i] = Vector3i{vertex_begin, vertex_begin + 1, vertex_begin + 2};
+        positions[vertex_begin] = Vector3{Float{0.0}, Float{0.0}, Float{0.0}};
+        positions[vertex_begin + 1] =
+            Vector3{Float{1.0} + s, Float{0.02}, Float{0.0}};
+        positions[vertex_begin + 2] =
+            Vector3{Float{0.01}, Float{1.0} - s, Float{0.03}};
+        thicknesses[vertex_begin]      = thickness;
+        thicknesses[vertex_begin + 1]  = thickness;
+        thicknesses[vertex_begin + 2]  = thickness;
+        inverse_rest_shape_matrices[i] = Matrix2x2::Identity();
+
+        Vector9 X;
+        for(int local = 0; local < 3; ++local)
+            X.segment<3>(3 * local) = positions[vertex_begin + local];
+        Float energy;
+        NH::E(energy,
+              lambdas[i],
+              mus[i],
+              X,
+              inverse_rest_shape_matrices[i]);
+        expected[i] = energy * rest_areas[i] * Float{2.0} * thickness * Dt * Dt;
+    }
+
+    DeviceBuffer<Float>     d_lambdas;
+    DeviceBuffer<Float>     d_mus;
+    DeviceBuffer<Float>     d_rest_areas;
+    DeviceBuffer<Float>     d_thicknesses;
+    DeviceBuffer<Float>     d_energies(count);
+    DeviceBuffer<Vector3i>  d_indices;
+    DeviceBuffer<Vector3>   d_positions;
+    DeviceBuffer<Matrix2x2> d_inverse_rest_shape_matrices;
+    copy_to_device(d_lambdas, lambdas);
+    copy_to_device(d_mus, mus);
+    copy_to_device(d_rest_areas, rest_areas);
+    copy_to_device(d_thicknesses, thicknesses);
+    copy_to_device(d_indices, indices);
+    copy_to_device(d_positions, positions);
+    copy_to_device(d_inverse_rest_shape_matrices, inverse_rest_shape_matrices);
+
+    launch_neo_hookean_shell_2d_energy(
+        NeoHookeanShell2DEnergyLaunchInfo{
+            .lambdas                     = d_lambdas.cview(),
+            .mus                         = d_mus.cview(),
+            .rest_areas                  = d_rest_areas.cview(),
+            .thicknesses                 = d_thicknesses.cview(),
+            .energies                    = d_energies.view(),
+            .indices                     = d_indices.cview(),
+            .positions                   = d_positions.cview(),
+            .inverse_rest_shape_matrices = d_inverse_rest_shape_matrices.cview(),
+            .dt                          = Dt});
+
+    std::vector<Float> actual;
+    d_energies.copy_to(actual);
+    REQUIRE(actual.size() == expected.size());
+    for(std::size_t i = 0; i < actual.size(); ++i)
+    {
+        const Float scale = std::max<Float>(Float{1.0}, std::abs(expected[i]));
+        REQUIRE(std::isfinite(actual[i]));
+        REQUIRE(std::abs(actual[i] - expected[i]) <= Float{1.0e-12} * scale);
+    }
 }
 }  // namespace
 
-TEST_CASE("Neo-Hookean shell energy is invariant to CTA128 launch geometry",
+TEST_CASE("Neo-Hookean shell production energy launcher covers CTA64 boundaries",
           "[cuda][line_search][neo_energy_launch]")
 {
-    for(int count : std::array{1, 127, 128, 129, 257, 4097})
-        compare_default_and_cta128(count);
+    for(int count : std::array{0, 1, 63, 64, 65, 127, 128, 129})
+        check_production_energy_launcher(count);
 }
