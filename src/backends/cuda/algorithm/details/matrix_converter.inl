@@ -24,8 +24,16 @@ namespace
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if(i >= n)
             return;
-        ij_hash(i) = matrix_converter_pack_radix_key(
-            row_indices(i), col_indices(i), radix_key_config);
+        const int row = row_indices(i);
+        const int col = col_indices(i);
+        UIPC_KERNEL_ASSERT(matrix_converter_radix_index_is_valid(
+                               row, radix_key_config.rows),
+                           "MatrixConverter row index is outside [-1, rows)");
+        UIPC_KERNEL_ASSERT(matrix_converter_radix_index_is_valid(
+                               col, radix_key_config.cols),
+                           "MatrixConverter column index is outside [-1, cols)");
+        ij_hash(i) =
+            matrix_converter_pack_radix_key(row, col, radix_key_config);
         sort_index(i) = i;
     }
 
@@ -68,8 +76,16 @@ namespace
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if(i >= n)
             return;
-        ij_hash(i) = matrix_converter_pack_radix_key(
-            row_indices(i), col_indices(i), radix_key_config);
+        const int row = row_indices(i);
+        const int col = col_indices(i);
+        UIPC_KERNEL_ASSERT(matrix_converter_radix_index_is_valid(
+                               row, radix_key_config.rows),
+                           "MatrixConverter row index is outside [-1, rows)");
+        UIPC_KERNEL_ASSERT(matrix_converter_radix_index_is_valid(
+                               col, radix_key_config.cols),
+                           "MatrixConverter column index is outside [-1, cols)");
+        ij_hash(i) =
+            matrix_converter_pack_radix_key(row, col, radix_key_config);
         sort_index(i) = i;
     }
 

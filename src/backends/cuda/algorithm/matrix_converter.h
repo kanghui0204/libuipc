@@ -12,47 +12,80 @@ struct MatrixConverterIntPair
 
 struct MatrixConverterRadixKeyConfig
 {
+    int      rows;
+    int      cols;
     int      col_bits;
     int      end_bit;
     uint64_t col_mask;
     bool     compact;
 };
 
-constexpr int matrix_converter_index_bits(int extent)
+// Valid indices occupy [0, extent), while extent itself encodes the -1
+// sentinel.  Computing the width from extent (rather than extent - 1)
+// reserves that extra code without evaluating extent + 1, which could
+// overflow when extent == INT_MAX.
+constexpr int matrix_converter_radix_code_bits(int extent)
 {
-    auto value = extent > 1 ? static_cast<uint32_t>(extent - 1) : uint32_t{0};
+    auto value = extent > 0 ? static_cast<uint32_t>(extent) : uint32_t{0};
     int  bits  = 1;
     while(value >>= 1)
         ++bits;
     return bits;
 }
 
+inline UIPC_GENERIC constexpr bool matrix_converter_radix_index_is_valid(int index,
+                                                                          int extent)
+{
+    return index >= -1 && index < extent;
+}
+
 constexpr MatrixConverterRadixKeyConfig matrix_converter_radix_key_config(int rows,
                                                                            int cols)
 {
     if(rows <= 0 || cols <= 0)
-        return {32, 64, 0xFFFFFFFFull, false};
+        return {rows, cols, 32, 64, 0xFFFFFFFFull, false};
 
-    const int col_bits = matrix_converter_index_bits(cols);
-    const int end_bit  = col_bits + matrix_converter_index_bits(rows);
+    const int col_bits = matrix_converter_radix_code_bits(cols);
+    const int end_bit  = col_bits + matrix_converter_radix_code_bits(rows);
     if(col_bits >= 64 || end_bit > 64)
-        return {32, 64, 0xFFFFFFFFull, false};
+        return {rows, cols, 32, 64, 0xFFFFFFFFull, false};
 
-    return {col_bits, end_bit, (uint64_t{1} << col_bits) - uint64_t{1}, true};
+    return {rows,
+            cols,
+            col_bits,
+            end_bit,
+            (uint64_t{1} << col_bits) - uint64_t{1},
+            true};
 }
 
 inline UIPC_GENERIC constexpr uint64_t matrix_converter_pack_radix_key(
     int row, int col, const MatrixConverterRadixKeyConfig& config)
 {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(row)) << config.col_bits)
-           | static_cast<uint64_t>(static_cast<uint32_t>(col));
+    if(!config.compact)
+    {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(row))
+                << config.col_bits)
+               | static_cast<uint64_t>(static_cast<uint32_t>(col));
+    }
+
+    const auto row_code =
+        row == -1 ? static_cast<uint32_t>(config.rows) : static_cast<uint32_t>(row);
+    const auto col_code =
+        col == -1 ? static_cast<uint32_t>(config.cols) : static_cast<uint32_t>(col);
+    return (static_cast<uint64_t>(row_code) << config.col_bits)
+           | static_cast<uint64_t>(col_code);
 }
 
 inline UIPC_GENERIC constexpr MatrixConverterIntPair matrix_converter_unpack_radix_key(
     uint64_t key, const MatrixConverterRadixKeyConfig& config)
 {
-    return {static_cast<int>(key >> config.col_bits),
-            static_cast<int>(key & config.col_mask)};
+    const auto row_code = static_cast<uint32_t>(key >> config.col_bits);
+    const auto col_code = static_cast<uint32_t>(key & config.col_mask);
+    if(!config.compact)
+        return {static_cast<int>(row_code), static_cast<int>(col_code)};
+
+    return {row_code == static_cast<uint32_t>(config.rows) ? -1 : static_cast<int>(row_code),
+            col_code == static_cast<uint32_t>(config.cols) ? -1 : static_cast<int>(col_code)};
 }
 
 constexpr bool operator==(const MatrixConverterIntPair& l, const MatrixConverterIntPair& r)
