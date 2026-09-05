@@ -7,6 +7,7 @@
 #include <Eigen/Eigenvalues>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -111,25 +112,23 @@ __global__ void fixed_size_evd_test_kernel(const Float* input,
     output_status[matrix_id] = finite ? 0 : 2;
 }
 
-template <int N>
-void run_fixed_size_evd_test()
+template <int N, int BlockSize, int LanePitch>
+void run_fixed_size_evd_test(int count)
 {
     static_assert(std::is_same_v<Float, double>);
+    static_assert(BlockSize > 0 && BlockSize <= LanePitch);
 
-    constexpr int Count     = 257;
-    constexpr int BlockSize = 16;
-    constexpr int LanePitch = 16;
     using MatrixN = Eigen::Matrix<Float, N, N>;
     using VectorN = Eigen::Matrix<Float, N, 1>;
 
-    std::mt19937_64                       generator(0x5eed0000ULL + N);
+    std::mt19937_64 generator(0x5eed0000ULL + N * 1000 + LanePitch * 10 + count);
     std::uniform_real_distribution<Float> distribution(-1.0, 1.0);
 
-    std::vector<Float>   input(static_cast<std::size_t>(Count) * N * N);
-    std::vector<MatrixN> expected_psd(Count);
-    std::vector<VectorN> expected_eigenvalues(Count);
+    std::vector<Float>   input(static_cast<std::size_t>(count) * N * N);
+    std::vector<MatrixN> expected_psd(count);
+    std::vector<VectorN> expected_eigenvalues(count);
 
-    for(int matrix_id = 0; matrix_id < Count; ++matrix_id)
+    for(int matrix_id = 0; matrix_id < count; ++matrix_id)
     {
         MatrixN matrix;
         for(int col = 0; col < N; ++col)
@@ -182,29 +181,29 @@ void run_fixed_size_evd_test()
     DeviceAllocation<Float> device_input(input.size());
     DeviceAllocation<Float> device_psd(input.size());
     DeviceAllocation<Float> device_eigenvalues(
-        static_cast<std::size_t>(Count) * N);
-    DeviceAllocation<int> device_status(Count);
+        static_cast<std::size_t>(count) * N);
+    DeviceAllocation<int> device_status(count);
 
     CUDA_TOOL_CHECK(cudaMemcpy(device_input.data(),
                                input.data(),
                                input.size() * sizeof(Float),
                                cudaMemcpyHostToDevice));
-    CUDA_TOOL_CHECK(cudaMemset(device_status.data(), 0xff, Count * sizeof(int)));
+    CUDA_TOOL_CHECK(cudaMemset(device_status.data(), 0xff, count * sizeof(int)));
 
     fixed_size_evd_test_kernel<N, LanePitch>
-        <<<(Count + BlockSize - 1) / BlockSize, BlockSize>>>(
+        <<<(count + BlockSize - 1) / BlockSize, BlockSize>>>(
             device_input.data(),
             device_psd.data(),
             device_eigenvalues.data(),
             device_status.data(),
-            Count);
+            count);
     CUDA_TOOL_CHECK(cudaGetLastError());
     CUDA_TOOL_CHECK(cudaDeviceSynchronize());
 
     std::vector<Float> output_psd(input.size());
     std::vector<Float> output_eigenvalues(
-        static_cast<std::size_t>(Count) * N);
-    std::vector<int> output_status(Count);
+        static_cast<std::size_t>(count) * N);
+    std::vector<int> output_status(count);
     CUDA_TOOL_CHECK(cudaMemcpy(output_psd.data(),
                                device_psd.data(),
                                output_psd.size() * sizeof(Float),
@@ -218,7 +217,7 @@ void run_fixed_size_evd_test()
                                output_status.size() * sizeof(int),
                                cudaMemcpyDeviceToHost));
 
-    for(int matrix_id = 0; matrix_id < Count; ++matrix_id)
+    for(int matrix_id = 0; matrix_id < count; ++matrix_id)
     {
         REQUIRE(output_status[matrix_id] == 0);
         const std::size_t matrix_offset =
@@ -243,14 +242,28 @@ void run_fixed_size_evd_test()
                 <= Float(1e-12));
     }
 }
+
+template <int BlockSize>
+void run_production_geometry_evd_tests()
+{
+    constexpr int LanePitch = BlockSize;
+    for(int count : std::array{1, BlockSize - 1, BlockSize, BlockSize + 1})
+    {
+        INFO("CTA=" << BlockSize << " count=" << count);
+        run_fixed_size_evd_test<6, BlockSize, LanePitch>(count);
+        run_fixed_size_evd_test<9, BlockSize, LanePitch>(count);
+        run_fixed_size_evd_test<12, BlockSize, LanePitch>(count);
+    }
+}
 }  // namespace
 
-TEST_CASE("fixed-bank shared EVD matches CPU Eigen", "[cuda][fixed_size_evd]")
+TEST_CASE("fixed-bank shared EVD matches CPU Eigen at production launch geometries",
+          "[cuda][fixed_size_evd]")
 {
     CUDA_TOOL_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 32 * 1024));
-    run_fixed_size_evd_test<6>();
-    run_fixed_size_evd_test<9>();
-    run_fixed_size_evd_test<12>();
+    run_production_geometry_evd_tests<8>();
+    run_production_geometry_evd_tests<16>();
+    run_production_geometry_evd_tests<32>();
 }
 
 template <int BlockSize>
@@ -333,4 +346,29 @@ TEST_CASE("contact block padding rejects IndexT overflow",
     REQUIRE_THROWS_AS(
         make_contact_type_block_layout<8>(IndexMax - 6, 0, 0, 0),
         uipc::Exception);
+}
+
+TEST_CASE("contact continuous layout rejects aggregate IndexT overflow",
+          "[contact_block_padding]")
+{
+    const auto ordinary = make_contact_type_contiguous_layout<int>(
+        SizeT{1}, SizeT{2}, SizeT{3}, SizeT{4});
+    REQUIRE(ordinary.pt_end == 1);
+    REQUIRE(ordinary.ee_end == 3);
+    REQUIRE(ordinary.pe_end == 6);
+    REQUIRE(ordinary.pp_end == 10);
+
+    constexpr SizeT IndexMax =
+        static_cast<SizeT>(std::numeric_limits<int>::max());
+
+    const auto largest = make_contact_type_contiguous_layout<int>(
+        IndexMax - 3, SizeT{1}, SizeT{1}, SizeT{1});
+    REQUIRE(largest.pt_end == std::numeric_limits<int>::max() - 3);
+    REQUIRE(largest.ee_end == std::numeric_limits<int>::max() - 2);
+    REQUIRE(largest.pe_end == std::numeric_limits<int>::max() - 1);
+    REQUIRE(largest.pp_end == std::numeric_limits<int>::max());
+
+    REQUIRE_THROWS_AS(make_contact_type_contiguous_layout<int>(
+                          IndexMax - 2, SizeT{1}, SizeT{1}, SizeT{1}),
+                      uipc::Exception);
 }
