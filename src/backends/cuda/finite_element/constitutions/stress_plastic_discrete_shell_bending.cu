@@ -123,7 +123,7 @@ namespace
         }
         else
         {
-            constexpr int SharedLanePitch = 16;
+            constexpr int SharedLanePitch = 32;
             __shared__ Float shared_h[12 * 12 * SharedLanePitch];
 
             Vector12 G12;
@@ -440,7 +440,7 @@ class StressPlasticDiscreteShellBending final : public FiniteElementExtraConstit
         {
             auto k =
                 StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel<false>;
-            constexpr int BlockSize = 16;
+            constexpr int BlockSize = 32;
             k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
                 stencils.view(),
                 bending_stiffnesses.view(),
