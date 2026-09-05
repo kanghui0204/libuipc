@@ -4,6 +4,7 @@
 #include <utils/codim_thickness.h>
 #include <utils/fixed_bank_soa_evd.h>
 #include <utils/four_vertex_translation_free_spd.h>
+#include <utils/contact_type_block_layout.h>
 #include <kernel_cout.h>
 #include <utils/matrix_assembler.h>
 #include <utils/primitive_d_hat.h>
@@ -273,8 +274,11 @@ namespace
                                        cuda_tool::CBufferView<Vector2i> PPs,
                                        cuda_tool::DoubletVectorView<Float, 3> PP_Gs,
                                        cuda_tool::TripletMatrixView<Float, 3> PP_Hs,
+                                       IndexT pt_end,
                                        IndexT ee_offset,
+                                       IndexT ee_end,
                                        IndexT pe_offset,
+                                       IndexT pe_end,
                                        IndexT pp_offset,
                                        int    n)
     {
@@ -282,12 +286,12 @@ namespace
         if(idx >= n)
             return;
 
-        constexpr int SharedLanePitch = 16;
+        constexpr int SharedLanePitch = 8;
         __shared__ Float shared_h[GradientOnly ? 1 : 12 * 12 * SharedLanePitch];
 
         using namespace sym::codim_ipc_simplex_contact;
 
-        if(idx < ee_offset)  // PT
+        if(idx < pt_end)  // PT
         {
             int      i    = idx;
             Vector4i PT   = PTs(i);
@@ -331,7 +335,11 @@ namespace
                     .write_psd_from_eigendecomposition(PT, H, eigen_values);
             }
         }
-        else if(idx < pe_offset)  // EE
+        else if(idx < ee_offset)
+        {
+            return;
+        }
+        else if(idx < ee_end)  // EE
         {
             int      i    = idx - ee_offset;
             Vector4i EE   = EEs(i);
@@ -381,7 +389,11 @@ namespace
                     .write_psd_from_eigendecomposition(EE, H, eigen_values);
             }
         }
-        else if(idx < pp_offset)  // PE
+        else if(idx < pe_offset)
+        {
+            return;
+        }
+        else if(idx < pe_end)  // PE
         {
             int      i  = idx - pe_offset;
             Vector3i PE = PEs(i);
@@ -416,6 +428,10 @@ namespace
                 TMA.half_block<3>(i * SimplexNormalContact::PEHalfHessianSize)
                     .write_psd_from_eigendecomposition(PE, H, eigen_values);
             }
+        }
+        else if(idx < pp_offset)
+        {
+            return;
         }
         else
         {
@@ -533,18 +549,40 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
         using namespace cuda_tool;
         using namespace sym::codim_ipc_simplex_contact;
 
-        auto pt_count = (IndexT)info.PTs().size();
-        auto ee_count = (IndexT)info.EEs().size();
-        auto pe_count = (IndexT)info.PEs().size();
-        auto pp_count = (IndexT)info.PPs().size();
-        auto total    = pt_count + ee_count + pe_count + pp_count;
+        constexpr SizeT IndexMax =
+            static_cast<SizeT>(std::numeric_limits<IndexT>::max());
+        UIPC_ASSERT(info.PTs().size() <= IndexMax && info.EEs().size() <= IndexMax
+                        && info.PEs().size() <= IndexMax
+                        && info.PPs().size() <= IndexMax,
+                    "Simplex normal contact count exceeds the IndexT limit: PT={}, EE={}, PE={}, PP={}",
+                    info.PTs().size(),
+                    info.EEs().size(),
+                    info.PEs().size(),
+                    info.PPs().size());
+
+        auto pt_count = static_cast<IndexT>(info.PTs().size());
+        auto ee_count = static_cast<IndexT>(info.EEs().size());
+        auto pe_count = static_cast<IndexT>(info.PEs().size());
+        auto pp_count = static_cast<IndexT>(info.PPs().size());
+
+        const std::uint64_t total_wide =
+            static_cast<std::uint64_t>(pt_count)
+            + static_cast<std::uint64_t>(ee_count)
+            + static_cast<std::uint64_t>(pe_count)
+            + static_cast<std::uint64_t>(pp_count);
+        UIPC_ASSERT(total_wide <= static_cast<std::uint64_t>(IndexMax),
+                    "Simplex normal contact total {} exceeds the IndexT limit {}",
+                    total_wide,
+                    IndexMax);
+        const auto total = static_cast<IndexT>(total_wide);
+
+        constexpr int FullHessianBlockSize = 8;
+        const auto padded_layout =
+            make_contact_type_block_layout<FullHessianBlockSize>(
+                pt_count, ee_count, pe_count, pp_count);
 
         if(total == 0)
             return;
-
-        IndexT ee_offset = pt_count;
-        IndexT pe_offset = ee_offset + ee_count;
-        IndexT pp_offset = pe_offset + pe_count;
 
         // Keep all contact types in one launch: rare PT/EE Hessians are
         // individually expensive, and splitting them serializes work that the
@@ -553,10 +591,17 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
         auto launch = [&]<bool GradientOnly>()
         {
             auto k = do_assemble_kernel<GradientOnly>;
-            const int block_size = GradientOnly ? cuda_tool::best_block_dim(k) : 16;
-            const int grid_size  = GradientOnly ?
-                                       cuda_tool::best_grid_dim(total, k) :
-                                       (total + block_size - 1) / block_size;
+            const IndexT pt_end = pt_count;
+            const IndexT ee_offset = GradientOnly ? pt_count : padded_layout.ee_offset;
+            const IndexT ee_end = ee_offset + ee_count;
+            const IndexT pe_offset = GradientOnly ? ee_end : padded_layout.pe_offset;
+            const IndexT pe_end = pe_offset + pe_count;
+            const IndexT pp_offset = GradientOnly ? pe_end : padded_layout.pp_offset;
+            const int launch_size = GradientOnly ? total : padded_layout.padded_total;
+            const int block_size = GradientOnly ? cuda_tool::best_block_dim(k) :
+                                                  FullHessianBlockSize;
+            const int grid_size = launch_size / block_size
+                                  + (launch_size % block_size != 0);
             k<<<grid_size, block_size, 0, nullptr>>>(
                 info.contact_tabular().viewer(),
                 info.contact_element_ids().viewer(),
@@ -577,10 +622,13 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
                 info.PPs().viewer(),
                 info.PP_gradients().viewer(),
                 info.PP_hessians().viewer(),
+                pt_end,
                 ee_offset,
+                ee_end,
                 pe_offset,
+                pe_end,
                 pp_offset,
-                total);
+                launch_size);
         };
 
         if(info.gradient_only())
