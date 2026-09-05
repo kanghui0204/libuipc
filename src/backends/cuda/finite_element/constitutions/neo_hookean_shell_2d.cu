@@ -1,4 +1,5 @@
 #include <finite_element/codim_2d_constitution.h>
+#include <finite_element/constitutions/neo_hookean_shell_2d_energy.h>
 #include <finite_element/constitutions/neo_hookean_shell_2d_function.h>
 #include <kernel_cout.h>
 #include <cuda_tool/cuda_tool.h>
@@ -126,6 +127,28 @@ namespace
     }
 }  // namespace
 
+void launch_neo_hookean_shell_2d_energy(
+    const NeoHookeanShell2DEnergyLaunchInfo& info)
+{
+    const int n = static_cast<int>(info.indices.size());
+    if(n == 0)
+        return;
+
+    constexpr int BlockSize = 64;
+    NeoHookeanShell2D_do_compute_energy_kernel<<<
+        (n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
+        info.lambdas,
+        info.mus,
+        info.rest_areas,
+        info.thicknesses,
+        info.energies,
+        info.indices,
+        info.positions,
+        info.inverse_rest_shape_matrices,
+        info.dt,
+        n);
+}
+
 class NeoHookeanShell2D final : public Codim2DConstitution
 {
   public:
@@ -221,26 +244,17 @@ class NeoHookeanShell2D final : public Codim2DConstitution
 
     virtual void do_compute_energy(ComputeEnergyInfo& info) override
     {
-        auto k = NeoHookeanShell2D_do_compute_energy_kernel;
-        int  n = (int)info.indices().size();
-        if(n > 0)
-        {
-            constexpr int energy_threads = 64;
-            k<<<(n + energy_threads - 1) / energy_threads,
-                 energy_threads,
-                 0,
-                 nullptr>>>(
-                lambdas.cview(),
-                mus.cview(),
-                info.rest_areas(),
-                info.thicknesses(),
-                info.energies(),
-                info.indices(),
-                info.xs(),
-                inv_B_matrices.cview(),
-                info.dt(),
-                n);
-        }
+        launch_neo_hookean_shell_2d_energy(
+            NeoHookeanShell2DEnergyLaunchInfo{
+                .lambdas                    = lambdas.cview(),
+                .mus                        = mus.cview(),
+                .rest_areas                 = info.rest_areas(),
+                .thicknesses                = info.thicknesses(),
+                .energies                   = info.energies(),
+                .indices                    = info.indices(),
+                .positions                  = info.xs(),
+                .inverse_rest_shape_matrices = inv_B_matrices.cview(),
+                .dt                         = info.dt()});
     }
 
     virtual void do_compute_gradient_hessian(ComputeGradientHessianInfo& info) override
