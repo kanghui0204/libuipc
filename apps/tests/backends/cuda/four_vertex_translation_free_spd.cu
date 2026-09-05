@@ -19,8 +19,9 @@ constexpr int ParameterCount   = 3;
 constexpr int ContactCaseCount = PTCaseCount + EECaseCount;
 constexpr int CaseCount        = 1 + ParameterCount * ContactCaseCount;
 constexpr int Dof              = 12;
-constexpr int BlockSize        = 16;
-constexpr int LanePitch        = 16;
+// The production normal-contact Hessian path uses CTA8 / lane pitch 8.
+constexpr int BlockSize        = 8;
+constexpr int LanePitch        = 8;
 
 template <typename T>
 class DeviceAllocation
