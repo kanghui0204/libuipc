@@ -197,30 +197,29 @@ void launch_ipc_simplex_frictional_contact_energy(
     if(pp_end == 0)
         return;
 
+    constexpr int BlockSize = 64;
     ipc_simplex_frictional_contact_energy_kernel<<<
-        cuda_tool::best_grid_dim(pp_end, ipc_simplex_frictional_contact_energy_kernel),
-        cuda_tool::best_block_dim(ipc_simplex_frictional_contact_energy_kernel),
-        0,
-        nullptr>>>(info.contact_tabular.viewer(),
-                   info.contact_element_ids,
-                   info.positions,
-                   info.prev_positions,
-                   info.rest_positions,
-                   info.thicknesses,
-                   info.d_hats,
-                   info.PTs,
-                   info.EEs,
-                   info.PEs,
-                   info.PPs,
-                   info.PT_energies,
-                   info.EE_energies,
-                   info.PE_energies,
-                   info.PP_energies,
-                   info.eps_velocity,
-                   info.dt,
-                   pt_end,
-                   ee_end,
-                   pe_end,
-                   pp_end);
+        (pp_end + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
+        info.contact_tabular.viewer(),
+        info.contact_element_ids,
+        info.positions,
+        info.prev_positions,
+        info.rest_positions,
+        info.thicknesses,
+        info.d_hats,
+        info.PTs,
+        info.EEs,
+        info.PEs,
+        info.PPs,
+        info.PT_energies,
+        info.EE_energies,
+        info.PE_energies,
+        info.PP_energies,
+        info.eps_velocity,
+        info.dt,
+        pt_end,
+        ee_end,
+        pe_end,
+        pp_end);
 }
 }  // namespace uipc::backend::cuda
