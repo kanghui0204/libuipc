@@ -18,13 +18,22 @@ namespace
         cuda_tool::CBufferView<int>     col_indices,
         cuda_tool::BufferView<uint64_t> ij_hash,
         cuda_tool::BufferView<int>      sort_index,
+        MatrixConverterRadixKeyConfig   radix_key_config,
         int                             n)
     {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if(i >= n)
             return;
-        ij_hash(i) = (static_cast<uint64_t>(row_indices(i)) << 32)
-                     + static_cast<uint64_t>(col_indices(i));
+        const int row = row_indices(i);
+        const int col = col_indices(i);
+        UIPC_KERNEL_ASSERT(matrix_converter_radix_index_is_valid(
+                               row, radix_key_config.rows),
+                           "MatrixConverter row index is outside [-1, rows)");
+        UIPC_KERNEL_ASSERT(matrix_converter_radix_index_is_valid(
+                               col, radix_key_config.cols),
+                           "MatrixConverter column index is outside [-1, cols)");
+        ij_hash(i) =
+            matrix_converter_pack_radix_key(row, col, radix_key_config);
         sort_index(i) = i;
     }
 
@@ -32,16 +41,13 @@ namespace
     __global__ void matrix_converter_radix_sort_indices_and_blocks_k2_kernel(
         cuda_tool::BufferView<uint64_t>               ij_hash,
         cuda_tool::BufferView<MatrixConverterIntPair> ij_pairs,
+        MatrixConverterRadixKeyConfig                 radix_key_config,
         int                                           n)
     {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if(i >= n)
             return;
-        auto hash      = ij_hash(i);
-        auto row_index = static_cast<int>(hash >> 32);
-        auto col_index = static_cast<int>(hash & 0xFFFFFFFF);
-        ij_pairs(i).x  = row_index;
-        ij_pairs(i).y  = col_index;
+        ij_pairs(i) = matrix_converter_unpack_radix_key(ij_hash(i), radix_key_config);
     }
 
     // MatrixConverter::_radix_sort_indices_and_blocks(from, to) #3: sort the block values
@@ -64,12 +70,22 @@ namespace
         cuda_tool::CBufferView<int>     col_indices,
         cuda_tool::BufferView<uint64_t> ij_hash,
         cuda_tool::BufferView<int>      sort_index,
+        MatrixConverterRadixKeyConfig   radix_key_config,
         int                             n)
     {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if(i >= n)
             return;
-        ij_hash(i) = (uint64_t{row_indices(i)} << 32) + uint64_t{col_indices(i)};
+        const int row = row_indices(i);
+        const int col = col_indices(i);
+        UIPC_KERNEL_ASSERT(matrix_converter_radix_index_is_valid(
+                               row, radix_key_config.rows),
+                           "MatrixConverter row index is outside [-1, rows)");
+        UIPC_KERNEL_ASSERT(matrix_converter_radix_index_is_valid(
+                               col, radix_key_config.cols),
+                           "MatrixConverter column index is outside [-1, cols)");
+        ij_hash(i) =
+            matrix_converter_pack_radix_key(row, col, radix_key_config);
         sort_index(i) = i;
     }
 
@@ -77,16 +93,13 @@ namespace
     __global__ void matrix_converter_radix_sort_indices_and_blocks_in_place_k2_kernel(
         cuda_tool::BufferView<uint64_t>               ij_hash,
         cuda_tool::BufferView<MatrixConverterIntPair> ij_pairs,
+        MatrixConverterRadixKeyConfig                 radix_key_config,
         int                                           n)
     {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if(i >= n)
             return;
-        auto hash      = ij_hash(i);
-        auto row_index = int{hash >> 32};
-        auto col_index = int{hash & 0xFFFFFFFF};
-        ij_pairs(i).x  = row_index;
-        ij_pairs(i).y  = col_index;
+        ij_pairs(i) = matrix_converter_unpack_radix_key(ij_hash(i), radix_key_config);
     }
 
     // MatrixConverter::_radix_sort_indices_and_blocks(to) #3: sort the block values
@@ -357,6 +370,8 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(
     loose_resize(sort_index, src_row_indices.size());
     loose_resize(ij_pairs, src_row_indices.size());
 
+    const auto radix_key_config =
+        matrix_converter_radix_key_config(from.rows(), from.cols());
 
     // hash ij
     int n_hash_ij = (int)src_row_indices.size();
@@ -366,13 +381,16 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(
             src_col_indices,
             ij_hash_input.view(),
             sort_index_input.view(),
+            radix_key_config,
             n_hash_ij);
 
     DeviceRadixSort().SortPairs(ij_hash_input.data(),
                                 ij_hash.data(),
                                 sort_index_input.data(),
                                 sort_index.data(),
-                                ij_hash.size());
+                                ij_hash.size(),
+                                0,
+                                radix_key_config.end_bit);
 
     // set ij_hash back to row_indices and col_indices
 
@@ -382,7 +400,7 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(
     int n_unpack_ij = (int)dst_row_indices.size();
     if(n_unpack_ij > 0)
         matrix_converter_radix_sort_indices_and_blocks_k2_kernel<<<(n_unpack_ij + 256 - 1) / 256, 256, 0, nullptr>>>(
-            ij_hash.view(), ij_pairs.view(), n_unpack_ij);
+            ij_hash.view(), ij_pairs.view(), radix_key_config, n_unpack_ij);
 
     // sort the block values
 
@@ -412,6 +430,8 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(cuda_tool::DeviceBCOO
     loose_resize(sort_index, src_row_indices.size());
     loose_resize(ij_pairs, src_row_indices.size());
 
+    const auto radix_key_config =
+        matrix_converter_radix_key_config(to.rows(), to.cols());
 
     // hash ij
     int n_hash_ij = (int)src_row_indices.size();
@@ -421,13 +441,16 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(cuda_tool::DeviceBCOO
             src_col_indices.cview(),
             ij_hash_input.view(),
             sort_index_input.view(),
+            radix_key_config,
             n_hash_ij);
 
     DeviceRadixSort().SortPairs(ij_hash_input.data(),
                                 ij_hash.data(),
                                 sort_index_input.data(),
                                 sort_index.data(),
-                                ij_hash.size());
+                                ij_hash.size(),
+                                0,
+                                radix_key_config.end_bit);
 
     // set ij_hash back to row_indices and col_indices
 
@@ -437,7 +460,7 @@ void MatrixConverter<T, N>::_radix_sort_indices_and_blocks(cuda_tool::DeviceBCOO
     int n_unpack_ij = (int)dst_row_indices.size();
     if(n_unpack_ij > 0)
         matrix_converter_radix_sort_indices_and_blocks_in_place_k2_kernel<<<(n_unpack_ij + 256 - 1) / 256, 256, 0, nullptr>>>(
-            ij_hash.view(), ij_pairs.view(), n_unpack_ij);
+            ij_hash.view(), ij_pairs.view(), radix_key_config, n_unpack_ij);
 
     // sort the block values
 
