@@ -426,6 +426,7 @@ bool GlobalLinearSystem::Impl::_update_subsystem_extent()
     if(dof_count_changed)
     {
         diag_dof_offsets_counts.scan();
+        ++dof_layout_generation;
     }
     total_dof = diag_dof_offsets_counts.total_count();
     if(x.capacity() < total_dof)

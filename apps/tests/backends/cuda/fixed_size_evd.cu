@@ -334,3 +334,28 @@ TEST_CASE("contact block padding rejects IndexT overflow",
         make_contact_type_block_layout<8>(IndexMax - 6, 0, 0, 0),
         uipc::Exception);
 }
+
+TEST_CASE("contact continuous layout rejects aggregate IndexT overflow",
+          "[contact_block_padding]")
+{
+    const auto ordinary = make_contact_type_contiguous_layout<int>(
+        SizeT{1}, SizeT{2}, SizeT{3}, SizeT{4});
+    REQUIRE(ordinary.pt_end == 1);
+    REQUIRE(ordinary.ee_end == 3);
+    REQUIRE(ordinary.pe_end == 6);
+    REQUIRE(ordinary.pp_end == 10);
+
+    constexpr SizeT IndexMax =
+        static_cast<SizeT>(std::numeric_limits<int>::max());
+
+    const auto largest = make_contact_type_contiguous_layout<int>(
+        IndexMax - 3, SizeT{1}, SizeT{1}, SizeT{1});
+    REQUIRE(largest.pt_end == std::numeric_limits<int>::max() - 3);
+    REQUIRE(largest.ee_end == std::numeric_limits<int>::max() - 2);
+    REQUIRE(largest.pe_end == std::numeric_limits<int>::max() - 1);
+    REQUIRE(largest.pp_end == std::numeric_limits<int>::max());
+
+    REQUIRE_THROWS_AS(make_contact_type_contiguous_layout<int>(
+                          IndexMax - 2, SizeT{1}, SizeT{1}, SizeT{1}),
+                      uipc::Exception);
+}
