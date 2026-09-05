@@ -520,8 +520,9 @@ void fused_update_converged(cuda_tool::CVarView<Float> d_rz_new,
         d_rz_new.cviewer(), d_converged.viewer(), d_rz_tol.cviewer(), n);
 }
 
-// One PCG iteration on `stream`; the unit of both graph capture and the
-// uncaptured fallback. Kernels/arguments/order are identical either way.
+// One reference PCG iteration on `stream`, used by the uncaptured fallback.
+// The Graph path below implements the same recurrence with its specialized
+// pipelined and fused kernels.
 // `timed` adds the per-iteration "SpMV"/"Apply Preconditioner" Timers —
 // plain path only; during graph capture no Timer objects may be created
 // (empirically corrupts state in the single-process test suite binary).
@@ -562,7 +563,7 @@ void LinearFusedPCG::run_graph_iteration(cuda_tool::DenseVectorView<Float> x,
 {
     const SizeT next_slot = slot ^ SizeT{1};
 
-    // Ap = A * p and pAp = p^T * Ap. The same CTA256 kernel clears the
+    // Ap = A * p and pAp = p^T * Ap. The same pipelined kernel clears the
     // opposite slot for its next use and skips the full sparse traversal once
     // an earlier iteration in this replay block converges.
     spmv_dot_pipelined(p.cview(),
