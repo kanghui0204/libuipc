@@ -562,7 +562,7 @@ void LinearFusedPCG::run_graph_iteration(cuda_tool::DenseVectorView<Float> x,
 {
     const SizeT next_slot = slot ^ SizeT{1};
 
-    // Ap = A * p and pAp = p^T * Ap. The same CTA256 kernel clears the
+    // Ap = A * p and pAp = p^T * Ap. The same pipelined kernel clears the
     // opposite slot for its next use and skips the full sparse traversal once
     // an earlier iteration in this replay block converges.
     spmv_dot_pipelined(p.cview(),

@@ -12,16 +12,13 @@ namespace uipc::backend::cuda
 // SpMV and dot(p,Ap) are fused into a single kernel pass.
 // Convergence is checked every `check_interval` iterations via a single D2H copy.
 //
-// CUDA graph replay: the per-iteration kernel chain (spmv_dot -> update_xr ->
-// preconditioner -> dot -> converged -> update_p -> swap_rz) launches ~10
-// tiny kernels per iteration whose launch gaps dominate the wall time
-// (~80us of ~118us per iteration on case2-scale scenes). When
-// `linear_system/use_cuda_graph` is on (default), a block of
-// `check_interval` iterations is recorded once per (buffer-set, N) and
-// replayed as one graph launch; kernels, arguments and ordering are
-// identical to the non-graph path, so numerics are unchanged. If capture
-// fails (e.g. a preconditioner launches outside the capture stream), the
-// solver permanently falls back to the plain loop for that instance.
+// CUDA graph replay records a block of `check_interval` iterations once per
+// (buffer-set, N) and replays it as one graph launch. The graph path implements
+// the same PCG recurrence with pipelined SpMV clears, fused local-preconditioner
+// update/apply/dot work, and fused direction publication; the uncaptured path
+// keeps the reference kernel sequence. If capture fails (e.g. a preconditioner
+// launches outside the capture stream), the solver permanently falls back to
+// the plain loop for that instance.
 class LinearFusedPCG : public IterativeSolver
 {
   public:
