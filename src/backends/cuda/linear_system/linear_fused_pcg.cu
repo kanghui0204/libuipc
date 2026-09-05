@@ -520,8 +520,9 @@ void fused_update_converged(cuda_tool::CVarView<Float> d_rz_new,
         d_rz_new.cviewer(), d_converged.viewer(), d_rz_tol.cviewer(), n);
 }
 
-// One PCG iteration on `stream`; the unit of both graph capture and the
-// uncaptured fallback. Kernels/arguments/order are identical either way.
+// One reference PCG iteration on `stream`, used by the uncaptured fallback.
+// The Graph path below implements the same recurrence with its specialized
+// pipelined and fused kernels.
 // `timed` adds the per-iteration "SpMV"/"Apply Preconditioner" Timers —
 // plain path only; during graph capture no Timer objects may be created
 // (empirically corrupts state in the single-process test suite binary).

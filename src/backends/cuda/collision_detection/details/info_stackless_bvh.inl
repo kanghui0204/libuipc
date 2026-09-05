@@ -836,7 +836,7 @@ namespace
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Build pipeline — identical to InfoStacklessBVH
+// Build and refit pipeline
 // ---------------------------------------------------------------------------
 
 inline void InfoStacklessBVH::Impl::calcMaxBVFromBox(cuda_tool::CBufferView<AABB> aabbs,
