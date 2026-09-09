@@ -330,6 +330,10 @@ class GlobalLinearSystem : public SimSystem
         std::vector<int> accuracy_statisfied_flags;
         std::vector<int> no_precond_diag_subsystem_indices;
 
+        // Segment fusion may update x/r once per local preconditioner only
+        // when each subsystem has one owner. Fixed after initialization.
+        bool local_preconditioner_owners_unique = true;
+
         // Containers
         SimSystemSlotCollection<DiagLinearSubsystem>    diag_subsystems;
         SimSystemSlotCollection<OffDiagLinearSubsystem> off_diag_subsystems;
@@ -430,6 +434,7 @@ class GlobalLinearSystem : public SimSystem
     friend class GlobalPreconditioner;
     friend class GlobalDiffSimManager;
     friend class CurrentFrameDiffDofReporter;
+    friend class DuplicateLocalPreconditionerTestAccess;
 
     void add_subsystem(DiagLinearSubsystem* subsystem);
     void add_subsystem(OffDiagLinearSubsystem* subsystem);

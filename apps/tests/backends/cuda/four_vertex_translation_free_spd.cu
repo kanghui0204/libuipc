@@ -187,12 +187,12 @@ __global__ void generate_cases_kernel(Float* raw)
             raw[std::size_t(index) * Dof * Dof + col * Dof + row] = H(row, col);
 }
 
-template <bool Reduced>
+template <bool Reduced, int Count = CaseCount>
 __global__ void project_cases_kernel(const Float* raw, Float* projected, int* status)
 {
     __shared__ Float workspace_storage[Dof * Dof * LanePitch];
     const int index = int(blockIdx.x * blockDim.x + threadIdx.x);
-    if(index >= CaseCount)
+    if(index >= Count)
         return;
     FixedBankSoAMap<Dof, LanePitch> H(workspace_storage + threadIdx.x);
     const std::size_t offset = std::size_t(index) * Dof * Dof;
@@ -292,5 +292,74 @@ TEST_CASE("four-vertex normal-contact PSD reduction matches full EVD",
         REQUIRE(max_translation_residual(raw_matrix) <= 1e-10 * (1.0 + scale));
         REQUIRE(max_translation_residual(reduced_matrix) <= tolerance);
         REQUIRE(max_abs <= tolerance);
+    }
+}
+
+TEST_CASE("four-vertex PSD reduction avoids overflow in finite Hadamard sums",
+          "[cuda][contact][normal][translation_free_evd]")
+{
+    // The input entries are at most 3e307, and the nonzero eigenvalue is
+    // +/-1.2e308. Both are representable. Summing before multiplying by 0.5
+    // in the second Hadamard transform nevertheless used to form +/-2.4e308.
+    constexpr int Count = 4;
+    const Float eigenvalues[Count] = {1.2e308, -1.2e308, 1e300, -1e300};
+    Vector12 mode = Vector12::Zero();
+    mode(0) = mode(3) = 0.5;
+    mode(6) = mode(9) = -0.5;
+    const Matrix12x12 projector = mode * mode.transpose();
+    const std::size_t matrix_values = std::size_t(Count) * Dof * Dof;
+    std::vector<Float> raw(matrix_values);
+    for(int index = 0; index < Count; ++index)
+        for(int col = 0; col < Dof; ++col)
+            for(int row = 0; row < Dof; ++row)
+                raw[std::size_t(index) * Dof * Dof + col * Dof + row] =
+                    eigenvalues[index] * projector(row, col);
+
+    DeviceAllocation<Float> raw_device(matrix_values);
+    DeviceAllocation<Float> full_device(matrix_values);
+    DeviceAllocation<Float> reduced_device(matrix_values);
+    DeviceAllocation<int> full_status_device(Count);
+    DeviceAllocation<int> reduced_status_device(Count);
+    CUDA_TOOL_CHECK(cudaMemcpy(raw_device.data(), raw.data(), matrix_values * sizeof(Float), cudaMemcpyHostToDevice));
+    project_cases_kernel<false, Count><<<1, BlockSize>>>(
+        raw_device.data(), full_device.data(), full_status_device.data());
+    project_cases_kernel<true, Count><<<1, BlockSize>>>(
+        raw_device.data(), reduced_device.data(), reduced_status_device.data());
+    CUDA_TOOL_CHECK(cudaGetLastError());
+    CUDA_TOOL_CHECK(cudaDeviceSynchronize());
+
+    std::vector<Float> full(matrix_values);
+    std::vector<Float> reduced(matrix_values);
+    std::vector<int> full_status(Count);
+    std::vector<int> reduced_status(Count);
+    CUDA_TOOL_CHECK(cudaMemcpy(full.data(), full_device.data(), matrix_values * sizeof(Float), cudaMemcpyDeviceToHost));
+    CUDA_TOOL_CHECK(cudaMemcpy(reduced.data(), reduced_device.data(), matrix_values * sizeof(Float), cudaMemcpyDeviceToHost));
+    CUDA_TOOL_CHECK(cudaMemcpy(full_status.data(), full_status_device.data(), Count * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_TOOL_CHECK(cudaMemcpy(reduced_status.data(), reduced_status_device.data(), Count * sizeof(int), cudaMemcpyDeviceToHost));
+
+    for(int index = 0; index < Count; ++index)
+    {
+        INFO("eigenvalue=" << eigenvalues[index]);
+        REQUIRE(full_status[index] == 0);
+        REQUIRE(reduced_status[index] == 0);
+        const Float magnitude = std::abs(eigenvalues[index]);
+        const Matrix12x12 expected =
+            (eigenvalues[index] > 0.0 ? 1.0 : 0.0) * projector;
+        // Normalize before differences, sums, or norms, so the oracle itself
+        // cannot overflow merely because the finite Hessian is large.
+        const Matrix12x12 full_normalized =
+            Eigen::Map<const Matrix12x12>(full.data() + index * Dof * Dof) / magnitude;
+        const Matrix12x12 reduced_normalized =
+            Eigen::Map<const Matrix12x12>(reduced.data() + index * Dof * Dof) / magnitude;
+        REQUIRE(full_normalized.allFinite());
+        REQUIRE(reduced_normalized.allFinite());
+        REQUIRE((full_normalized - expected).cwiseAbs().maxCoeff() <= 2e-12);
+        REQUIRE((reduced_normalized - expected).cwiseAbs().maxCoeff() <= 2e-12);
+        REQUIRE((reduced_normalized - full_normalized).cwiseAbs().maxCoeff() <= 2e-12);
+        REQUIRE((reduced_normalized - reduced_normalized.transpose()).cwiseAbs().maxCoeff() <= 2e-12);
+        REQUIRE(max_translation_residual(reduced_normalized.data()) <= 2e-12);
+        Eigen::SelfAdjointEigenSolver<Matrix12x12> solver(reduced_normalized);
+        REQUIRE(solver.info() == Eigen::Success);
+        REQUIRE(solver.eigenvalues().minCoeff() >= -2e-12);
     }
 }
