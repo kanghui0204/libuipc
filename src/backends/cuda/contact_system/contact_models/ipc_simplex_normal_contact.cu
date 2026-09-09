@@ -1,5 +1,6 @@
 #include <contact_system/simplex_normal_contact.h>
 #include <contact_system/contact_models/codim_ipc_simplex_normal_contact_function.h>
+#include <contact_system/contact_models/ipc_simplex_normal_contact_energy.h>
 #include <utils/distance/distance_flagged.h>
 #include <utils/codim_thickness.h>
 #include <kernel_cout.h>
@@ -12,246 +13,6 @@ namespace uipc::backend::cuda
 {
 namespace
 {
-    __global__ void do_compute_energy_k1_kernel(cuda_tool::CDense2D<ContactCoeff> table,
-                                                cuda_tool::CBufferView<IndexT> contact_ids,
-                                                cuda_tool::CBufferView<Vector4i> PTs,
-                                                cuda_tool::BufferView<Float> Es,
-                                                cuda_tool::CBufferView<Vector3> Ps,
-                                                cuda_tool::CBufferView<Float> thicknesses,
-                                                cuda_tool::CBufferView<Float> d_hats,
-                                                Float dt,
-                                                int   n)
-    {
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if(i >= n)
-            return;
-
-        using namespace sym::codim_ipc_simplex_contact;
-
-        Vector4i PT = PTs(i);
-
-        Vector4i cids = {contact_ids(PT[0]),
-                         contact_ids(PT[1]),
-                         contact_ids(PT[2]),
-                         contact_ids(PT[3])};
-        Float    kt2  = PT_kappa(table, cids) * dt * dt;
-
-        const auto& P  = Ps(PT[0]);
-        const auto& T0 = Ps(PT[1]);
-        const auto& T1 = Ps(PT[2]);
-        const auto& T2 = Ps(PT[3]);
-
-
-        Float thickness = PT_thickness(thicknesses(PT(0)),
-                                       thicknesses(PT(1)),
-                                       thicknesses(PT(2)),
-                                       thicknesses(PT(3)));
-
-        Float d_hat =
-            PT_d_hat(d_hats(PT(0)), d_hats(PT(1)), d_hats(PT(2)), d_hats(PT(3)));
-
-        Vector4i flag = distance::point_triangle_distance_flag(P, T0, T1, T2);
-
-        if constexpr(RUNTIME_CHECK)
-        {
-            Float D;
-            distance::point_triangle_distance2(flag, P, T0, T1, T2, D);
-
-            Vector2 range = D_range(thickness, d_hat);
-
-            UIPC_KERNEL_ASSERT(is_active_D(range, D),
-                               "PT[%d,%d,%d,%d] d^2(%f) out of range, (%f,%f)",
-                               PT(0),
-                               PT(1),
-                               PT(2),
-                               PT(3),
-                               D,
-                               range(0),
-                               range(1));
-        }
-
-        Es(i) = PT_barrier_energy(flag, kt2, d_hat, thickness, P, T0, T1, T2);
-    }
-
-    __global__ void do_compute_energy_k2_kernel(cuda_tool::CDense2D<ContactCoeff> table,
-                                                cuda_tool::CBufferView<IndexT> contact_ids,
-                                                cuda_tool::CBufferView<Vector4i> EEs,
-                                                cuda_tool::BufferView<Float> Es,
-                                                cuda_tool::CBufferView<Vector3> Ps,
-                                                cuda_tool::CBufferView<Float> thicknesses,
-                                                cuda_tool::CBufferView<Vector3> rest_Ps,
-                                                cuda_tool::CBufferView<Float> d_hats,
-                                                Float dt,
-                                                int   n)
-    {
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if(i >= n)
-            return;
-
-        using namespace sym::codim_ipc_simplex_contact;
-
-        Vector4i EE = EEs(i);
-
-        Vector4i cids = {contact_ids(EE[0]),
-                         contact_ids(EE[1]),
-                         contact_ids(EE[2]),
-                         contact_ids(EE[3])};
-        Float    kt2  = EE_kappa(table, cids) * dt * dt;
-
-        const auto& E0 = Ps(EE[0]);
-        const auto& E1 = Ps(EE[1]);
-        const auto& E2 = Ps(EE[2]);
-        const auto& E3 = Ps(EE[3]);
-
-        const auto& t0_Ea0 = rest_Ps(EE[0]);
-        const auto& t0_Ea1 = rest_Ps(EE[1]);
-        const auto& t0_Eb0 = rest_Ps(EE[2]);
-        const auto& t0_Eb1 = rest_Ps(EE[3]);
-
-        Float thickness = EE_thickness(thicknesses(EE(0)),
-                                       thicknesses(EE(1)),
-                                       thicknesses(EE(2)),
-                                       thicknesses(EE(3)));
-
-        Float d_hat =
-            EE_d_hat(d_hats(EE(0)), d_hats(EE(1)), d_hats(EE(2)), d_hats(EE(3)));
-
-        Vector4i flag = distance::edge_edge_distance_flag(E0, E1, E2, E3);
-
-        if constexpr(RUNTIME_CHECK)
-        {
-            Float D;
-            distance::edge_edge_distance2(flag, E0, E1, E2, E3, D);
-            Vector2 range = D_range(thickness, d_hat);
-            UIPC_KERNEL_ASSERT(is_active_D(range, D),
-                               "EE[%d,%d,%d,%d] d^2(%f) out of range, (%f,%f)",
-                               EE(0),
-                               EE(1),
-                               EE(2),
-                               EE(3),
-                               D,
-                               range(0),
-                               range(1));
-        }
-
-
-        Es(i) = mollified_EE_barrier_energy(flag,
-                                            // coefficients
-                                            kt2,
-                                            d_hat,
-                                            thickness,
-                                            // positions
-                                            t0_Ea0,
-                                            t0_Ea1,
-                                            t0_Eb0,
-                                            t0_Eb1,
-                                            E0,
-                                            E1,
-                                            E2,
-                                            E3);
-    }
-
-    __global__ void do_compute_energy_k3_kernel(cuda_tool::CDense2D<ContactCoeff> table,
-                                                cuda_tool::CBufferView<IndexT> contact_ids,
-                                                cuda_tool::CBufferView<Vector3i> PEs,
-                                                cuda_tool::BufferView<Float> Es,
-                                                cuda_tool::CBufferView<Vector3> Ps,
-                                                cuda_tool::CBufferView<Float> thicknesses,
-                                                cuda_tool::CBufferView<Float> d_hats,
-                                                Float dt,
-                                                int   n)
-    {
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if(i >= n)
-            return;
-
-        using namespace sym::codim_ipc_simplex_contact;
-
-        Vector3i PE = PEs(i);
-
-        Vector3i cids = {contact_ids(PE[0]), contact_ids(PE[1]), contact_ids(PE[2])};
-        Float kt2 = PE_kappa(table, cids) * dt * dt;
-
-        const auto& P  = Ps(PE[0]);
-        const auto& E0 = Ps(PE[1]);
-        const auto& E1 = Ps(PE[2]);
-
-        Float thickness =
-            PE_thickness(thicknesses(PE(0)), thicknesses(PE(1)), thicknesses(PE(2)));
-
-        Float d_hat = PE_d_hat(d_hats(PE(0)), d_hats(PE(1)), d_hats(PE(2)));
-
-        Vector3i flag = distance::point_edge_distance_flag(P, E0, E1);
-
-        if constexpr(RUNTIME_CHECK)
-        {
-            Float D;
-            distance::point_edge_distance2(flag, P, E0, E1, D);
-
-            Vector2 range = D_range(thickness, d_hat);
-
-            UIPC_KERNEL_ASSERT(is_active_D(range, D),
-                               "PE[%d,%d,%d] d^2(%f) out of range, (%f,%f)",
-                               PE(0),
-                               PE(1),
-                               PE(2),
-                               D,
-                               range(0),
-                               range(1));
-        }
-
-        Es(i) = PE_barrier_energy(flag, kt2, d_hat, thickness, P, E0, E1);
-    }
-
-    __global__ void do_compute_energy_k4_kernel(cuda_tool::CDense2D<ContactCoeff> table,
-                                                cuda_tool::CBufferView<IndexT> contact_ids,
-                                                cuda_tool::CBufferView<Vector2i> PPs,
-                                                cuda_tool::BufferView<Float> Es,
-                                                cuda_tool::CBufferView<Vector3> Ps,
-                                                cuda_tool::CBufferView<Float> thicknesses,
-                                                cuda_tool::CBufferView<Float> d_hats,
-                                                Float dt,
-                                                int   n)
-    {
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if(i >= n)
-            return;
-
-        using namespace sym::codim_ipc_simplex_contact;
-
-        Vector2i PP = PPs(i);
-
-        Vector2i cids = {contact_ids(PP[0]), contact_ids(PP[1])};
-        Float    kt2  = PP_kappa(table, cids) * dt * dt;
-
-        const auto& Pa = Ps(PP[0]);
-        const auto& Pb = Ps(PP[1]);
-
-        Float thickness = PP_thickness(thicknesses(PP(0)), thicknesses(PP(1)));
-
-        Float d_hat = PP_d_hat(d_hats(PP(0)), d_hats(PP(1)));
-
-        Vector2i flag = distance::point_point_distance_flag(Pa, Pb);
-
-        if constexpr(RUNTIME_CHECK)
-        {
-            Float D;
-            distance::point_point_distance2(flag, Pa, Pb, D);
-
-            Vector2 range = D_range(thickness, d_hat);
-
-            UIPC_KERNEL_ASSERT(is_active_D(range, D),
-                               "PP[%d,%d] d^2(%f) out of range, (%f,%f)",
-                               PP(0),
-                               PP(1),
-                               D,
-                               range(0),
-                               range(1));
-        }
-
-        Es(i) = PP_barrier_energy(flag, kt2, d_hat, thickness, Pa, Pb);
-    }
-
     template <bool GradientOnly>
     __global__ void do_assemble_kernel(cuda_tool::CDense2D<ContactCoeff> table,
                                        cuda_tool::CBufferView<IndexT> contact_ids,
@@ -453,65 +214,23 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
 
     virtual void do_compute_energy(EnergyInfo& info) override
     {
-        using namespace cuda_tool;
-        using namespace sym::codim_ipc_simplex_contact;
-
-        // Compute Point-Triangle energy
-        auto PT_count = info.PTs().size();
-        if(PT_count > 0)
-            do_compute_energy_k1_kernel<<<cuda_tool::best_grid_dim((int)PT_count, do_compute_energy_k1_kernel), cuda_tool::best_block_dim(do_compute_energy_k1_kernel), 0, nullptr>>>(
-                info.contact_tabular().viewer(),
-                info.contact_element_ids().viewer(),
-                info.PTs().viewer(),
-                info.PT_energies().viewer(),
-                info.positions().viewer(),
-                info.thicknesses().viewer(),
-                info.d_hats().viewer(),
-                info.dt(),
-                (int)PT_count);
-
-        // Compute Edge-Edge energy
-        auto EE_count = info.EEs().size();
-        if(EE_count > 0)
-            do_compute_energy_k2_kernel<<<cuda_tool::best_grid_dim((int)EE_count, do_compute_energy_k2_kernel), cuda_tool::best_block_dim(do_compute_energy_k2_kernel), 0, nullptr>>>(
-                info.contact_tabular().viewer(),
-                info.contact_element_ids().viewer(),
-                info.EEs().viewer(),
-                info.EE_energies().viewer(),
-                info.positions().viewer(),
-                info.thicknesses().viewer(),
-                info.rest_positions().viewer(),
-                info.d_hats().viewer(),
-                info.dt(),
-                (int)EE_count);
-
-        // Compute Point-Edge energy
-        auto PE_count = info.PEs().size();
-        if(PE_count > 0)
-            do_compute_energy_k3_kernel<<<cuda_tool::best_grid_dim((int)PE_count, do_compute_energy_k3_kernel), cuda_tool::best_block_dim(do_compute_energy_k3_kernel), 0, nullptr>>>(
-                info.contact_tabular().viewer(),
-                info.contact_element_ids().viewer(),
-                info.PEs().viewer(),
-                info.PE_energies().viewer(),
-                info.positions().viewer(),
-                info.thicknesses().viewer(),
-                info.d_hats().viewer(),
-                info.dt(),
-                (int)PE_count);
-
-        // Compute Point-Point energy
-        auto PP_count = info.PPs().size();
-        if(PP_count > 0)
-            do_compute_energy_k4_kernel<<<cuda_tool::best_grid_dim((int)PP_count, do_compute_energy_k4_kernel), cuda_tool::best_block_dim(do_compute_energy_k4_kernel), 0, nullptr>>>(
-                info.contact_tabular().viewer(),
-                info.contact_element_ids().viewer(),
-                info.PPs().viewer(),
-                info.PP_energies().viewer(),
-                info.positions().viewer(),
-                info.thicknesses().viewer(),
-                info.d_hats().viewer(),
-                info.dt(),
-                (int)PP_count);
+        launch_ipc_simplex_normal_contact_energy(
+            IPCSimplexNormalContactEnergyLaunchInfo{
+                .contact_tabular     = info.contact_tabular(),
+                .contact_element_ids = info.contact_element_ids(),
+                .positions           = info.positions(),
+                .rest_positions      = info.rest_positions(),
+                .thicknesses         = info.thicknesses(),
+                .d_hats              = info.d_hats(),
+                .PTs                 = info.PTs(),
+                .EEs                 = info.EEs(),
+                .PEs                 = info.PEs(),
+                .PPs                 = info.PPs(),
+                .PT_energies         = info.PT_energies(),
+                .EE_energies         = info.EE_energies(),
+                .PE_energies         = info.PE_energies(),
+                .PP_energies         = info.PP_energies(),
+                .dt                  = info.dt()});
     }
 
     virtual void do_assemble(ContactInfo& info) override

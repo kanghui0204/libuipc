@@ -71,6 +71,14 @@ class DeviceReduce
     template <typename T>
     DeviceReduce& Sum(const T* in, T* out, int n)
     {
+        // CUB does not promise to write the output for an empty reduction.
+        // Callers reuse DeviceVar outputs across Line Search trials, so leaving
+        // an old value here would turn an empty energy range into stale energy.
+        if(n == 0)
+        {
+            CUDA_TOOL_CHECK(cudaMemsetAsync(out, 0, sizeof(T), m_stream));
+            return *this;
+        }
         details::run_with_temp_storage(
             [&](void* t, size_t& b, cudaStream_t s)
             { cub::DeviceReduce::Sum(t, b, in, out, n, s); },
