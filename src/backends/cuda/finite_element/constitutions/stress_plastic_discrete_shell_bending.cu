@@ -1,9 +1,10 @@
+#include <utils/material_gradient_hessian_launch.h>
 #include <finite_element/finite_element_extra_constitution.h>
 #include <finite_element/finite_element_method.h>
 #include <time_integrator/time_integrator.h>
 #include <uipc/builtin/attribute_name.h>
 #include <finite_element/constitutions/stress_plastic_discrete_shell_bending_function.h>
-#include <utils/make_spd.h>
+#include <utils/fixed_bank_soa_evd.h>
 #include <utils/matrix_assembler.h>
 #include <utils/dump_utils.h>
 #include <algorithm>
@@ -79,6 +80,7 @@ namespace
         energies(I) = E * V_bar * dt * dt;
     }
 
+    template <bool GradientOnly>
     __global__ void StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel(
         cuda_tool::BufferView<Vector4i>        stencils,
         cuda_tool::BufferView<Float>           bending_stiffnesses,
@@ -91,7 +93,6 @@ namespace
         cuda_tool::DoubletVectorView<Float, 3> G3s,
         cuda_tool::TripletMatrixView<Float, 3> H3x3s,
         Float                                  dt,
-        bool                                   gradient_only,
         int                                    n)
     {
         int I = blockIdx.x * blockDim.x + threadIdx.x;
@@ -112,23 +113,47 @@ namespace
 
         Float Vdt2 = V_bar * dt * dt;
 
-        Vector12    G12;
-        Matrix12x12 H12x12;
+        if constexpr(GradientOnly)
+        {
+            Vector12 G12;
+            SPDSB::dEdx(
+                G12, x0, x1, x2, x3, L0, h_bar, theta_bar, kappa, yield_stress);
+            G12 *= Vdt2;
+            DoubletVectorAssembler DVA{G3s};
+            DVA.segment<StencilSize>(I * StencilSize).write(stencil, G12);
+        }
+        else
+        {
+            constexpr int SharedLanePitch = 32;
+            __shared__ Float shared_h[12 * 12 * SharedLanePitch];
 
-        SPDSB::dEdx(G12, x0, x1, x2, x3, L0, h_bar, theta_bar, kappa, yield_stress);
-        G12 *= Vdt2;
-        DoubletVectorAssembler DVA{G3s};
-        DVA.segment<StencilSize>(I * StencilSize).write(stencil, G12);
+            Vector12 G12;
+            FixedBankSoAMap<12, SharedLanePitch> H12x12(
+                shared_h + threadIdx.x);
+            SPDSB::d2Edx2(G12,
+                          H12x12,
+                          x0,
+                          x1,
+                          x2,
+                          x3,
+                          L0,
+                          h_bar,
+                          theta_bar,
+                          kappa,
+                          yield_stress);
 
-        if(gradient_only)
-            return;
+            G12 *= Vdt2;
+            DoubletVectorAssembler DVA{G3s};
+            DVA.segment<StencilSize>(I * StencilSize).write(stencil, G12);
 
-        SPDSB::ddEddx(H12x12, x0, x1, x2, x3, L0, h_bar, theta_bar, kappa, yield_stress);
-        H12x12 *= Vdt2;
-        make_spd(H12x12);
-
-        TripletMatrixAssembler TMA{H3x3s};
-        TMA.half_block<StencilSize>(I * HalfHessianSize).write(stencil, H12x12);
+            H12x12 *= Vdt2;
+            Vector12 eigen_values;
+            selfadjoint_evd_fixed_bank_shared<12>(H12x12, eigen_values);
+            TripletMatrixAssembler TMA{H3x3s};
+            TMA.half_block<StencilSize>(I * HalfHessianSize)
+                .write_psd_from_eigendecomposition(
+                    stencil, H12x12, eigen_values);
+        }
     }
 
     __global__ void StressPlasticDiscreteShellBendingTimeIntegrator_do_update_state_kernel(
@@ -171,6 +196,51 @@ namespace
         }
     }
 }  // namespace
+
+void launch_stress_plastic_bending_gradient_hessian(const BendingGradientHessianLaunchInfo& info)
+{
+    int n = (int)info.stencils.size();
+    if(n <= 0)
+        return;
+
+    if(info.gradient_only)
+    {
+        auto k =
+            StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel<true>;
+        k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
+            info.stencils,
+            info.stiffnesses,
+            info.theta_bars,
+            info.yield_stresses,
+            info.h_bars,
+            info.volumes,
+            info.rest_lengths,
+            info.positions,
+            info.gradients,
+            info.hessians,
+            info.dt,
+            n);
+    }
+    else
+    {
+        auto k =
+            StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel<false>;
+        constexpr int BlockSize = 32;
+        k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
+            info.stencils,
+            info.stiffnesses,
+            info.theta_bars,
+            info.yield_stresses,
+            info.h_bars,
+            info.volumes,
+            info.rest_lengths,
+            info.positions,
+            info.gradients,
+            info.hessians,
+            info.dt,
+            n);
+    }
+}
 
 class StressPlasticDiscreteShellBending final : public FiniteElementExtraConstitution
 {
@@ -390,25 +460,11 @@ class StressPlasticDiscreteShellBending final : public FiniteElementExtraConstit
 
     virtual void do_compute_gradient_hessian(ComputeGradientHessianInfo& info) override
     {
-        auto k = StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel;
-        int n = (int)stencils.size();
-        if(n > 0)
-        {
-            k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
-                stencils.view(),
-                bending_stiffnesses.view(),
-                theta_bars.view(),
-                yield_stresses.view(),
-                h_bars.view(),
-                V_bars.view(),
-                rest_lengths.view(),
-                info.xs(),
-                info.gradients(),
-                info.hessians(),
-                info.dt(),
-                info.gradient_only(),
-                n);
-        }
+        launch_stress_plastic_bending_gradient_hessian(BendingGradientHessianLaunchInfo{
+            stencils.view(), bending_stiffnesses.view(), theta_bars.view(),
+            h_bars.view(), V_bars.view(), rest_lengths.view(), info.xs(),
+            info.gradients(), info.hessians(), info.dt(), info.gradient_only(),
+            yield_stresses.view()});
     }
 };
 REGISTER_SIM_SYSTEM(StressPlasticDiscreteShellBending);

@@ -59,6 +59,23 @@ namespace sym::codim_ipc_contact
         return table(cids[0], cids[1]);
     }
 
+    // friction_hessian() projects the only nonlinear part of the friction
+    // Hessian, a 2x2 tangent-space matrix, before it reaches this function.
+    // A congruence transform J^T H J preserves positive semidefiniteness when
+    // the physical scale mu * normal_force is finite and nonnegative.  Return
+    // whether callers may write the lifted Hessian directly.  Invalid scales
+    // deliberately return false so the assembly kernel keeps its old full-size
+    // projection as a fail-safe.
+    template <typename Hessian, int N>
+    inline __device__ bool lift_friction_hessian(Hessian&                    H,
+                                                 const Matrix<Float, 2, N>& J,
+                                                 const Matrix2x2&            H2x2,
+                                                 Float signed_scale)
+    {
+        H = J.transpose() * H2x2 * J;
+        return isfinite(signed_scale) && signed_scale >= 0.0;
+    }
+
     inline __device__ void PT_friction_basis(
         // out
         Float&               f,
@@ -145,8 +162,9 @@ namespace sym::codim_ipc_contact
         return E;
     }
 
-    inline __device__ void PT_friction_gradient_hessian(Vector12&    G,
-                                                        Matrix12x12& H,
+    template <typename Hessian>
+    inline __device__ bool PT_friction_gradient_hessian(Vector12& G,
+                                                        Hessian&  H,
                                                         Float        kappa,
                                                         Float        d_hat,
                                                         Float        thickness,
@@ -198,7 +216,7 @@ namespace sym::codim_ipc_contact
 
         Matrix2x2 H2x2;
         friction_hessian(H2x2, mu, f, eps_vh, tan_rel_dx);
-        H = J.transpose() * H2x2 * J;
+        return lift_friction_hessian(H, J, H2x2, mu * f);
     }
 
     inline __device__ void PT_friction_gradient(Vector12&      G,
@@ -334,8 +352,9 @@ namespace sym::codim_ipc_contact
         return E;
     }
 
-    inline __device__ void EE_friction_gradient_hessian(Vector12&    G,
-                                                        Matrix12x12& H,
+    template <typename Hessian>
+    inline __device__ bool EE_friction_gradient_hessian(Vector12& G,
+                                                        Hessian&  H,
                                                         Float        kappa,
                                                         Float        d_hat,
                                                         Float        thickness,
@@ -386,7 +405,7 @@ namespace sym::codim_ipc_contact
 
         Matrix2x2 H2x2;
         friction_hessian(H2x2, mu, f, eps_vh, tan_rel_dx);
-        H = J.transpose() * H2x2 * J;
+        return lift_friction_hessian(H, J, H2x2, mu * f);
     }
 
     inline __device__ void EE_friction_gradient(Vector12&      G,
@@ -517,8 +536,9 @@ namespace sym::codim_ipc_contact
         return E;
     }
 
-    inline __device__ void PE_friction_gradient_hessian(Vector9&   G,
-                                                        Matrix9x9& H,
+    template <typename Hessian>
+    inline __device__ bool PE_friction_gradient_hessian(Vector9& G,
+                                                        Hessian& H,
                                                         Float      kappa,
                                                         Float      d_hat,
                                                         Float      thickness,
@@ -566,7 +586,7 @@ namespace sym::codim_ipc_contact
 
         Matrix2x2 H2x2;
         friction_hessian(H2x2, mu, f, eps_vh, tan_rel_dx);
-        H = J.transpose() * H2x2 * J;
+        return lift_friction_hessian(H, J, H2x2, mu * f);
     }
 
     inline __device__ void PE_friction_gradient(Vector9&       G,
@@ -682,8 +702,9 @@ namespace sym::codim_ipc_contact
         return E;
     }
 
-    inline __device__ void PP_friction_gradient_hessian(Vector6&   G,
-                                                        Matrix6x6& H,
+    template <typename Hessian>
+    inline __device__ bool PP_friction_gradient_hessian(Vector6& G,
+                                                        Hessian& H,
                                                         Float      kappa,
                                                         Float      d_hat,
                                                         Float      thickness,
@@ -725,7 +746,7 @@ namespace sym::codim_ipc_contact
 
         Matrix2x2 H2x2;
         friction_hessian(H2x2, mu, f, eps_vh, tan_rel_dx);
-        H = J.transpose() * H2x2 * J;
+        return lift_friction_hessian(H, J, H2x2, mu * f);
     }
 
     inline __device__ void PP_friction_gradient(Vector6&       G,

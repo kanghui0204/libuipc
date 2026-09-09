@@ -89,8 +89,9 @@ namespace sym::codim_ipc_simplex_contact
         return B;
     }
 
+    template <typename Hessian>
     inline __device__ void PT_barrier_gradient_hessian(Vector12&      G,
-                                                       Matrix12x12&   H,
+                                                       Hessian&        H,
                                                        Float          kappa,
                                                        Float          d_hat,
                                                        Float          thickness,
@@ -130,8 +131,9 @@ namespace sym::codim_ipc_simplex_contact
         H = ddBddD * GradD * GradD.transpose() + dBdD * HessD;
     }
 
+    template <typename Hessian>
     inline __device__ void PT_barrier_gradient_hessian(Vector12&       G,
-                                                       Matrix12x12&    H,
+                                                       Hessian&         H,
                                                        const Vector4i& flag,
                                                        Float           kappa,
                                                        Float           d_hat,
@@ -229,8 +231,9 @@ namespace sym::codim_ipc_simplex_contact
         return ek * B;
     }
 
-    inline __device__ void mollified_EE_barrier_gradient_hessian(Vector12&    G,
-                                                                 Matrix12x12& H,
+    template <typename Hessian>
+    inline __device__ void mollified_EE_barrier_gradient_hessian(Vector12& G,
+                                                                 Hessian&  H,
                                                                  const Vector4i& flag,
                                                                  Float kappa,
                                                                  Float d_hat,
@@ -367,8 +370,9 @@ namespace sym::codim_ipc_simplex_contact
         return E;
     }
 
+    template <typename Hessian>
     inline __device__ void PE_barrier_gradient_hessian(Vector9&        G,
-                                                       Matrix9x9&      H,
+                                                       Hessian&         H,
                                                        const Vector3i& flag,
                                                        Float           kappa,
                                                        Float           d_hat,
@@ -448,8 +452,9 @@ namespace sym::codim_ipc_simplex_contact
         return E;
     }
 
+    template <typename Hessian>
     inline __device__ void PP_barrier_gradient_hessian(Vector6&        G,
-                                                       Matrix6x6&      H,
+                                                       Hessian&         H,
                                                        const Vector2i& flag,
                                                        Float           kappa,
                                                        Float           d_hat,

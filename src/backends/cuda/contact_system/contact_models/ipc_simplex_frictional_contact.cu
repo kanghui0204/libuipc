@@ -1,9 +1,11 @@
 #include <contact_system/simplex_frictional_contact.h>
 #include <contact_system/contact_models/codim_ipc_simplex_frictional_contact_function.h>
 #include <contact_system/contact_models/ipc_simplex_frictional_contact_energy.h>
+#include <contact_system/contact_models/ipc_simplex_frictional_contact_assembly.h>
 #include <utils/codim_thickness.h>
+#include <utils/fixed_bank_soa_evd.h>
+#include <utils/contact_type_block_layout.h>
 #include <kernel_cout.h>
-#include <utils/make_spd.h>
 #include <utils/matrix_assembler.h>
 #include <utils/primitive_d_hat.h>
 #include <pipeline/ipc_pipeline_flag.h>
@@ -43,6 +45,9 @@ namespace
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if(idx >= n)
             return;
+
+        constexpr int SharedLanePitch = 16;
+        __shared__ Float shared_h[GradientOnly ? 1 : 12 * 12 * SharedLanePitch];
 
         using namespace sym::codim_ipc_contact;
 
@@ -85,15 +90,22 @@ namespace
             }
             else
             {
-                Matrix12x12 H;
-                PT_friction_gradient_hessian(
+                FixedBankSoAMap<12, SharedLanePitch> H(shared_h + threadIdx.x);
+                const bool hessian_is_psd = PT_friction_gradient_hessian(
                     G, H, kt2, d_hat, thickness, mu, eps_v * dt, prev_P, prev_T0, prev_T1, prev_T2, P, T0, T1, T2);
-                cuda::make_spd(H);
                 DoubletVectorAssembler DVA{PT_Gs};
                 DVA.segment<4>(i * 4).write(PT, G);
                 TripletMatrixAssembler TMA{PT_Hs};
-                TMA.half_block<4>(i * SimplexFrictionalContact::PTHalfHessianSize)
-                    .write(PT, H);
+                auto H_range =
+                    TMA.half_block<4>(i * SimplexFrictionalContact::PTHalfHessianSize);
+                if(hessian_is_psd)
+                    H_range.write_expression(PT, H);
+                else
+                {
+                    Vector12 eigen_values;
+                    selfadjoint_evd_fixed_bank_shared<12>(H, eigen_values);
+                    H_range.write_psd_from_eigendecomposition(PT, H, eigen_values);
+                }
             }
         }
         else if(idx < pe_offset)
@@ -148,7 +160,8 @@ namespace
             }
             else
             {
-                Matrix12x12 H;
+                FixedBankSoAMap<12, SharedLanePitch> H(shared_h + threadIdx.x);
+                bool hessian_is_psd = mollified;
                 if(mollified)
                 {
                     G.setZero();
@@ -156,15 +169,22 @@ namespace
                 }
                 else
                 {
-                    EE_friction_gradient_hessian(
+                    hessian_is_psd = EE_friction_gradient_hessian(
                         G, H, kt2, d_hat, thickness, mu, eps_v * dt, prev_Ea0, prev_Ea1, prev_Eb0, prev_Eb1, Ea0, Ea1, Eb0, Eb1);
-                    cuda::make_spd(H);
                 }
                 DoubletVectorAssembler DVA{EE_Gs};
                 DVA.segment<4>(i * 4).write(EE, G);
                 TripletMatrixAssembler TMA{EE_Hs};
-                TMA.half_block<4>(i * SimplexFrictionalContact::EEHalfHessianSize)
-                    .write(EE, H);
+                auto H_range =
+                    TMA.half_block<4>(i * SimplexFrictionalContact::EEHalfHessianSize);
+                if(hessian_is_psd)
+                    H_range.write_expression(EE, H);
+                else
+                {
+                    Vector12 eigen_values;
+                    selfadjoint_evd_fixed_bank_shared<12>(H, eigen_values);
+                    H_range.write_psd_from_eigendecomposition(EE, H, eigen_values);
+                }
             }
         }
         else if(idx < pp_offset)
@@ -198,15 +218,22 @@ namespace
             }
             else
             {
-                Matrix9x9 H;
-                PE_friction_gradient_hessian(
+                FixedBankSoAMap<9, SharedLanePitch> H(shared_h + threadIdx.x);
+                const bool hessian_is_psd = PE_friction_gradient_hessian(
                     G, H, kt2, d_hat, thickness, mu, eps_v * dt, prev_P, prev_E0, prev_E1, P, E0, E1);
-                cuda::make_spd(H);
                 DoubletVectorAssembler DVA{PE_Gs};
                 DVA.segment<3>(i * 3).write(PE, G);
                 TripletMatrixAssembler TMA{PE_Hs};
-                TMA.half_block<3>(i * SimplexFrictionalContact::PEHalfHessianSize)
-                    .write(PE, H);
+                auto H_range =
+                    TMA.half_block<3>(i * SimplexFrictionalContact::PEHalfHessianSize);
+                if(hessian_is_psd)
+                    H_range.write_expression(PE, H);
+                else
+                {
+                    Vector9 eigen_values;
+                    selfadjoint_evd_fixed_bank_shared<9>(H, eigen_values);
+                    H_range.write_psd_from_eigendecomposition(PE, H, eigen_values);
+                }
             }
         }
         else
@@ -237,20 +264,79 @@ namespace
             }
             else
             {
-                Matrix6x6 H;
-                PP_friction_gradient_hessian(
+                FixedBankSoAMap<6, SharedLanePitch> H(shared_h + threadIdx.x);
+                const bool hessian_is_psd = PP_friction_gradient_hessian(
                     G, H, kt2, d_hat, thickness, mu, eps_v * dt, prev_P0, prev_P1, P0, P1);
-                cuda::make_spd(H);
                 DoubletVectorAssembler DVA{PP_Gs};
                 DVA.segment<2>(i * 2).write(PP, G);
                 TripletMatrixAssembler TMA{PP_Hs};
-                TMA.half_block<2>(i * SimplexFrictionalContact::PPHalfHessianSize)
-                    .write(PP, H);
+                auto H_range =
+                    TMA.half_block<2>(i * SimplexFrictionalContact::PPHalfHessianSize);
+                if(hessian_is_psd)
+                    H_range.write_expression(PP, H);
+                else
+                {
+                    Vector6 eigen_values;
+                    selfadjoint_evd_fixed_bank_shared<6>(H, eigen_values);
+                    H_range.write_psd_from_eigendecomposition(PP, H, eigen_values);
+                }
             }
         }
     }
 
 }  // namespace
+
+void launch_ipc_simplex_frictional_contact_assembly(
+    const IPCSimplexFrictionalContactAssemblyLaunchInfo& info)
+{
+    const auto layout = make_contact_type_contiguous_layout<IndexT>(
+        info.PTs.size(), info.EEs.size(), info.PEs.size(), info.PPs.size());
+    const IndexT total = layout.pp_end;
+    if(total == 0)
+        return;
+
+    // Keep the production contiguous PT | EE | PE | PP dispatch and launch
+    // geometry in one place, shared by the system and focused tests.
+    auto launch = [&]<bool GradientOnly>()
+    {
+        auto k = do_assemble_kernel<GradientOnly>;
+        const int block_size = GradientOnly ? cuda_tool::best_block_dim(k) : 12;
+        const int grid_size  = GradientOnly ?
+                                   cuda_tool::best_grid_dim(total, k) :
+                                   total / block_size + (total % block_size != 0);
+        k<<<grid_size, block_size, 0, nullptr>>>(
+            info.contact_tabular.viewer(),
+            info.contact_element_ids.viewer(),
+            info.positions.viewer(),
+            info.prev_positions.viewer(),
+            info.rest_positions.viewer(),
+            info.thicknesses.viewer(),
+            info.d_hats.viewer(),
+            info.eps_velocity,
+            info.dt,
+            info.PTs.viewer(),
+            info.PT_gradients,
+            info.PT_hessians,
+            info.EEs.viewer(),
+            info.EE_gradients,
+            info.EE_hessians,
+            info.PEs.viewer(),
+            info.PE_gradients,
+            info.PE_hessians,
+            info.PPs.viewer(),
+            info.PP_gradients,
+            info.PP_hessians,
+            layout.pt_end,
+            layout.ee_end,
+            layout.pe_end,
+            total);
+    };
+
+    if(info.gradient_only)
+        launch.operator()<true>();
+    else
+        launch.operator()<false>();
+}
 
 class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
 {
@@ -287,60 +373,30 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
 
     virtual void do_assemble(ContactInfo& info) override
     {
-        using namespace cuda_tool;
-        using namespace sym::codim_ipc_contact;
-
-        auto pt_count = (IndexT)info.friction_PTs().size();
-        auto ee_count = (IndexT)info.friction_EEs().size();
-        auto pe_count = (IndexT)info.friction_PEs().size();
-        auto pp_count = (IndexT)info.friction_PPs().size();
-        auto total    = pt_count + ee_count + pe_count + pp_count;
-
-        if(total == 0)
-            return;
-
-        IndexT ee_offset = pt_count;
-        IndexT pe_offset = ee_offset + ee_count;
-        IndexT pp_offset = pe_offset + pe_count;
-
-        // Keep all contact types in one launch so rare, expensive PT/EE work
-        // overlaps the dominant PE population. Specialize only the uniform
-        // gradient/Hessian branch.
-        auto launch = [&]<bool GradientOnly>()
-        {
-            auto k = do_assemble_kernel<GradientOnly>;
-            k<<<cuda_tool::best_grid_dim(total, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
-                info.contact_tabular().viewer(),
-                info.contact_element_ids().viewer(),
-                info.positions().viewer(),
-                info.prev_positions().viewer(),
-                info.rest_positions().viewer(),
-                info.thicknesses().viewer(),
-                info.d_hats().viewer(),
-                info.eps_velocity(),
-                info.dt(),
-                info.friction_PTs().viewer(),
-                info.friction_PT_gradients().viewer(),
-                info.friction_PT_hessians().viewer(),
-                info.friction_EEs().viewer(),
-                info.friction_EE_gradients().viewer(),
-                info.friction_EE_hessians().viewer(),
-                info.friction_PEs().viewer(),
-                info.friction_PE_gradients().viewer(),
-                info.friction_PE_hessians().viewer(),
-                info.friction_PPs().viewer(),
-                info.friction_PP_gradients().viewer(),
-                info.friction_PP_hessians().viewer(),
-                ee_offset,
-                pe_offset,
-                pp_offset,
-                total);
-        };
-
-        if(info.gradient_only())
-            launch.operator()<true>();
-        else
-            launch.operator()<false>();
+        launch_ipc_simplex_frictional_contact_assembly(
+            IPCSimplexFrictionalContactAssemblyLaunchInfo{
+                .contact_tabular     = info.contact_tabular(),
+                .contact_element_ids = info.contact_element_ids(),
+                .positions           = info.positions(),
+                .prev_positions      = info.prev_positions(),
+                .rest_positions      = info.rest_positions(),
+                .thicknesses         = info.thicknesses(),
+                .d_hats              = info.d_hats(),
+                .PTs                 = info.friction_PTs(),
+                .EEs                 = info.friction_EEs(),
+                .PEs                 = info.friction_PEs(),
+                .PPs                 = info.friction_PPs(),
+                .PT_gradients        = info.friction_PT_gradients(),
+                .PT_hessians         = info.friction_PT_hessians(),
+                .EE_gradients        = info.friction_EE_gradients(),
+                .EE_hessians         = info.friction_EE_hessians(),
+                .PE_gradients        = info.friction_PE_gradients(),
+                .PE_hessians         = info.friction_PE_hessians(),
+                .PP_gradients        = info.friction_PP_gradients(),
+                .PP_hessians         = info.friction_PP_hessians(),
+                .eps_velocity        = info.eps_velocity(),
+                .dt                  = info.dt(),
+                .gradient_only       = info.gradient_only()});
     }
 };
 

@@ -1,11 +1,14 @@
 #include <contact_system/simplex_normal_contact.h>
 #include <contact_system/contact_models/codim_ipc_simplex_normal_contact_function.h>
 #include <contact_system/contact_models/ipc_simplex_normal_contact_energy.h>
+#include <contact_system/contact_models/ipc_simplex_normal_contact_assembly.h>
 #include <utils/distance/distance_flagged.h>
 #include <utils/codim_thickness.h>
+#include <utils/fixed_bank_soa_evd.h>
+#include <utils/four_vertex_translation_free_spd.h>
+#include <utils/contact_type_block_layout.h>
 #include <kernel_cout.h>
 #include <utils/matrix_assembler.h>
-#include <utils/make_spd.h>
 #include <utils/primitive_d_hat.h>
 #include <pipeline/ipc_pipeline_flag.h>
 
@@ -33,8 +36,11 @@ namespace
                                        cuda_tool::CBufferView<Vector2i> PPs,
                                        cuda_tool::DoubletVectorView<Float, 3> PP_Gs,
                                        cuda_tool::TripletMatrixView<Float, 3> PP_Hs,
+                                       IndexT pt_end,
                                        IndexT ee_offset,
+                                       IndexT ee_end,
                                        IndexT pe_offset,
+                                       IndexT pe_end,
                                        IndexT pp_offset,
                                        int    n)
     {
@@ -42,9 +48,12 @@ namespace
         if(idx >= n)
             return;
 
+        constexpr int SharedLanePitch = 8;
+        __shared__ Float shared_h[GradientOnly ? 1 : 12 * 12 * SharedLanePitch];
+
         using namespace sym::codim_ipc_simplex_contact;
 
-        if(idx < ee_offset)  // PT
+        if(idx < pt_end)  // PT
         {
             int      i    = idx;
             Vector4i PT   = PTs(i);
@@ -76,16 +85,23 @@ namespace
             }
             else
             {
-                Matrix12x12 H;
+                FixedBankSoAMap<12, SharedLanePitch> H(shared_h + threadIdx.x);
+                Vector12 eigen_values;
                 PT_barrier_gradient_hessian(G, H, flag, kt2, d_hat, thickness, P, T0, T1, T2);
-                make_spd(H);
+                selfadjoint_evd_four_vertex_translation_free_fixed_bank<
+                    SharedLanePitch>(H, eigen_values);
                 DoubletVectorAssembler DVA{PT_Gs};
                 DVA.segment<4>(i * 4).write(PT, G);
                 TripletMatrixAssembler TMA{PT_Hs};
-                TMA.half_block<4>(i * SimplexNormalContact::PTHalfHessianSize).write(PT, H);
+                TMA.half_block<4>(i * SimplexNormalContact::PTHalfHessianSize)
+                    .write_psd_from_eigendecomposition(PT, H, eigen_values);
             }
         }
-        else if(idx < pe_offset)  // EE
+        else if(idx < ee_offset)
+        {
+            return;
+        }
+        else if(idx < ee_end)  // EE
         {
             int      i    = idx - ee_offset;
             Vector4i EE   = EEs(i);
@@ -122,17 +138,24 @@ namespace
             }
             else
             {
-                Matrix12x12 H;
+                FixedBankSoAMap<12, SharedLanePitch> H(shared_h + threadIdx.x);
+                Vector12 eigen_values;
                 mollified_EE_barrier_gradient_hessian(
                     G, H, flag, kt2, d_hat, thickness, t0_Ea0, t0_Ea1, t0_Eb0, t0_Eb1, E0, E1, E2, E3);
-                make_spd(H);
+                selfadjoint_evd_four_vertex_translation_free_fixed_bank<
+                    SharedLanePitch>(H, eigen_values);
                 DoubletVectorAssembler DVA{EE_Gs};
                 DVA.segment<4>(i * 4).write(EE, G);
                 TripletMatrixAssembler TMA{EE_Hs};
-                TMA.half_block<4>(i * SimplexNormalContact::EEHalfHessianSize).write(EE, H);
+                TMA.half_block<4>(i * SimplexNormalContact::EEHalfHessianSize)
+                    .write_psd_from_eigendecomposition(EE, H, eigen_values);
             }
         }
-        else if(idx < pp_offset)  // PE
+        else if(idx < pe_offset)
+        {
+            return;
+        }
+        else if(idx < pe_end)  // PE
         {
             int      i  = idx - pe_offset;
             Vector3i PE = PEs(i);
@@ -157,14 +180,20 @@ namespace
             }
             else
             {
-                Matrix9x9 H;
+                FixedBankSoAMap<9, SharedLanePitch> H(shared_h + threadIdx.x);
+                Vector9 eigen_values;
                 PE_barrier_gradient_hessian(G, H, flag, kt2, d_hat, thickness, P, E0, E1);
-                make_spd(H);
+                selfadjoint_evd_fixed_bank_shared<9>(H, eigen_values);
                 DoubletVectorAssembler DVA{PE_Gs};
                 DVA.segment<3>(i * 3).write(PE, G);
                 TripletMatrixAssembler TMA{PE_Hs};
-                TMA.half_block<3>(i * SimplexNormalContact::PEHalfHessianSize).write(PE, H);
+                TMA.half_block<3>(i * SimplexNormalContact::PEHalfHessianSize)
+                    .write_psd_from_eigendecomposition(PE, H, eigen_values);
             }
+        }
+        else if(idx < pp_offset)
+        {
+            return;
         }
         else
         {
@@ -189,13 +218,15 @@ namespace
             }
             else
             {
-                Matrix6x6 H;
+                FixedBankSoAMap<6, SharedLanePitch> H(shared_h + threadIdx.x);
+                Vector6 eigen_values;
                 PP_barrier_gradient_hessian(G, H, flag, kt2, d_hat, thickness, P0, P1);
-                make_spd(H);
+                selfadjoint_evd_fixed_bank_shared<6>(H, eigen_values);
                 DoubletVectorAssembler DVA{PP_Gs};
                 DVA.segment<2>(i * 2).write(PP, G);
                 TripletMatrixAssembler TMA{PP_Hs};
-                TMA.half_block<2>(i * SimplexNormalContact::PPHalfHessianSize).write(PP, H);
+                TMA.half_block<2>(i * SimplexNormalContact::PPHalfHessianSize)
+                    .write_psd_from_eigendecomposition(PP, H, eigen_values);
             }
         }
     }
@@ -235,61 +266,120 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
 
     virtual void do_assemble(ContactInfo& info) override
     {
-        using namespace cuda_tool;
-        using namespace sym::codim_ipc_simplex_contact;
-
-        auto pt_count = (IndexT)info.PTs().size();
-        auto ee_count = (IndexT)info.EEs().size();
-        auto pe_count = (IndexT)info.PEs().size();
-        auto pp_count = (IndexT)info.PPs().size();
-        auto total    = pt_count + ee_count + pe_count + pp_count;
-
-        if(total == 0)
-            return;
-
-        IndexT ee_offset = pt_count;
-        IndexT pe_offset = ee_offset + ee_count;
-        IndexT pp_offset = pe_offset + pe_count;
-
-        // Keep all contact types in one launch: rare PT/EE Hessians are
-        // individually expensive, and splitting them serializes work that the
-        // fused launch overlaps with the dominant PE population. Specialize
-        // only the uniform gradient/Hessian branch.
-        auto launch = [&]<bool GradientOnly>()
-        {
-            auto k = do_assemble_kernel<GradientOnly>;
-            k<<<cuda_tool::best_grid_dim(total, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
-                info.contact_tabular().viewer(),
-                info.contact_element_ids().viewer(),
-                info.positions().viewer(),
-                info.rest_positions().viewer(),
-                info.thicknesses().viewer(),
-                info.d_hats().viewer(),
-                info.dt(),
-                info.PTs().viewer(),
-                info.PT_gradients().viewer(),
-                info.PT_hessians().viewer(),
-                info.EEs().viewer(),
-                info.EE_gradients().viewer(),
-                info.EE_hessians().viewer(),
-                info.PEs().viewer(),
-                info.PE_gradients().viewer(),
-                info.PE_hessians().viewer(),
-                info.PPs().viewer(),
-                info.PP_gradients().viewer(),
-                info.PP_hessians().viewer(),
-                ee_offset,
-                pe_offset,
-                pp_offset,
-                total);
-        };
-
-        if(info.gradient_only())
-            launch.operator()<true>();
-        else
-            launch.operator()<false>();
+        launch_ipc_simplex_normal_contact_assembly(
+            IPCSimplexNormalContactAssemblyLaunchInfo{
+                .contact_tabular     = info.contact_tabular(),
+                .contact_element_ids = info.contact_element_ids(),
+                .positions           = info.positions(),
+                .rest_positions      = info.rest_positions(),
+                .thicknesses         = info.thicknesses(),
+                .d_hats              = info.d_hats(),
+                .PTs                 = info.PTs(),
+                .EEs                 = info.EEs(),
+                .PEs                 = info.PEs(),
+                .PPs                 = info.PPs(),
+                .PT_gradients        = info.PT_gradients(),
+                .PT_hessians         = info.PT_hessians(),
+                .EE_gradients        = info.EE_gradients(),
+                .EE_hessians         = info.EE_hessians(),
+                .PE_gradients        = info.PE_gradients(),
+                .PE_hessians         = info.PE_hessians(),
+                .PP_gradients        = info.PP_gradients(),
+                .PP_hessians         = info.PP_hessians(),
+                .dt                  = info.dt(),
+                .gradient_only       = info.gradient_only()});
     }
 };
+
+void launch_ipc_simplex_normal_contact_assembly(
+    const IPCSimplexNormalContactAssemblyLaunchInfo& info)
+{
+    using namespace cuda_tool;
+    using namespace sym::codim_ipc_simplex_contact;
+
+    constexpr SizeT IndexMax =
+        static_cast<SizeT>(std::numeric_limits<IndexT>::max());
+    UIPC_ASSERT(info.PTs.size() <= IndexMax && info.EEs.size() <= IndexMax
+                    && info.PEs.size() <= IndexMax && info.PPs.size() <= IndexMax,
+                "Simplex normal contact count exceeds the IndexT limit: PT={}, EE={}, PE={}, PP={}",
+                info.PTs.size(),
+                info.EEs.size(),
+                info.PEs.size(),
+                info.PPs.size());
+
+    auto pt_count = static_cast<IndexT>(info.PTs.size());
+    auto ee_count = static_cast<IndexT>(info.EEs.size());
+    auto pe_count = static_cast<IndexT>(info.PEs.size());
+    auto pp_count = static_cast<IndexT>(info.PPs.size());
+
+    const std::uint64_t total_wide = static_cast<std::uint64_t>(pt_count)
+                                     + static_cast<std::uint64_t>(ee_count)
+                                     + static_cast<std::uint64_t>(pe_count)
+                                     + static_cast<std::uint64_t>(pp_count);
+    UIPC_ASSERT(total_wide <= static_cast<std::uint64_t>(IndexMax),
+                "Simplex normal contact total {} exceeds the IndexT limit {}",
+                total_wide,
+                IndexMax);
+    const auto total = static_cast<IndexT>(total_wide);
+
+    constexpr int FullHessianBlockSize = 8;
+    const auto padded_layout = make_contact_type_block_layout<FullHessianBlockSize>(
+        pt_count, ee_count, pe_count, pp_count);
+
+    if(total == 0)
+        return;
+
+    // Keep all contact types in one launch: rare PT/EE Hessians are
+    // individually expensive, and splitting them serializes work that the
+    // fused launch overlaps with the dominant PE population. Specialize
+    // only the uniform gradient/Hessian branch.
+    auto launch = [&]<bool GradientOnly>()
+    {
+        auto k = do_assemble_kernel<GradientOnly>;
+        const IndexT pt_end = pt_count;
+        const IndexT ee_offset = GradientOnly ? pt_count : padded_layout.ee_offset;
+        const IndexT ee_end = ee_offset + ee_count;
+        const IndexT pe_offset = GradientOnly ? ee_end : padded_layout.pe_offset;
+        const IndexT pe_end = pe_offset + pe_count;
+        const IndexT pp_offset = GradientOnly ? pe_end : padded_layout.pp_offset;
+        const int launch_size = GradientOnly ? total : padded_layout.padded_total;
+        const int block_size = GradientOnly ? cuda_tool::best_block_dim(k) :
+                                              FullHessianBlockSize;
+        const int grid_size = launch_size / block_size + (launch_size % block_size != 0);
+        k<<<grid_size, block_size, 0, nullptr>>>(
+            info.contact_tabular.viewer(),
+            info.contact_element_ids.viewer(),
+            info.positions.viewer(),
+            info.rest_positions.viewer(),
+            info.thicknesses.viewer(),
+            info.d_hats.viewer(),
+            info.dt,
+            info.PTs.viewer(),
+            info.PT_gradients.viewer(),
+            info.PT_hessians.viewer(),
+            info.EEs.viewer(),
+            info.EE_gradients.viewer(),
+            info.EE_hessians.viewer(),
+            info.PEs.viewer(),
+            info.PE_gradients.viewer(),
+            info.PE_hessians.viewer(),
+            info.PPs.viewer(),
+            info.PP_gradients.viewer(),
+            info.PP_hessians.viewer(),
+            pt_end,
+            ee_offset,
+            ee_end,
+            pe_offset,
+            pe_end,
+            pp_offset,
+            launch_size);
+    };
+
+    if(info.gradient_only)
+        launch.operator()<true>();
+    else
+        launch.operator()<false>();
+}
 
 REGISTER_SIM_SYSTEM(IPCSimplexNormalContact);
 }  // namespace uipc::backend::cuda

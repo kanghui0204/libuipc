@@ -100,5 +100,37 @@ namespace sym::discrete_shell_bending
         H = dthetadx * ddEddtheta * dthetadx.transpose() + dEdtheta * ddthetaddx;
     }
 
+    template <typename Hessian>
+    inline UIPC_GENERIC void d2Edx2(Vector12&      G,
+                                    Hessian&       H,
+                                    const Vector3& x0,
+                                    const Vector3& x1,
+                                    const Vector3& x2,
+                                    const Vector3& x3,
+                                    Float          L0,
+                                    Float          h_bar,
+                                    Float          theta_bar,
+                                    Float          kappa)
+    {
+        namespace DSB = sym::discrete_shell_bending;
+        Float theta;
+        dihedral_angle(x0, x1, x2, x3, theta);
+
+        Float dEdtheta;
+        DSB::dEdtheta(dEdtheta, kappa, theta, theta_bar, L0, h_bar);
+
+        Float ddEddtheta;
+        DSB::ddEddtheta(ddEddtheta, kappa, theta, theta_bar, L0, h_bar);
+
+        Vector12 dthetadx;
+        dihedral_angle_gradient(x0, x1, x2, x3, dthetadx);
+        G = dEdtheta * dthetadx;
+
+        Matrix12x12 ddthetaddx;
+        dihedral_angle_hessian(x0, x1, x2, x3, ddthetaddx);
+        H = dthetadx * ddEddtheta * dthetadx.transpose()
+            + dEdtheta * ddthetaddx;
+    }
+
 }  // namespace sym::discrete_shell_bending
 }  // namespace uipc::backend::cuda
