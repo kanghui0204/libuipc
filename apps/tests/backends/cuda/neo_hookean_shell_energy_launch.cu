@@ -109,9 +109,10 @@ void check_production_energy_launcher(int count)
 }
 }  // namespace
 
-TEST_CASE("Neo-Hookean shell production energy launcher covers CTA64 boundaries",
+TEST_CASE("Neo-Hookean shell production energy launcher covers CTA boundaries through 513 elements",
           "[cuda][line_search][neo_energy_launch]")
 {
-    for(int count : std::array{0, 1, 63, 64, 65, 127, 128, 129})
+    for(int count : std::array{0, 1, 63, 64, 65, 127, 128, 129,
+                              255, 256, 257, 511, 512, 513})
         check_production_energy_launcher(count);
 }

@@ -7,6 +7,7 @@
 #include <utils/distance/distance_flagged.h>
 #include <utils/primitive_d_hat.h>
 
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -191,13 +192,22 @@ void resize_and_copy_prefix(DeviceBuffer<T>& buffer,
 {
     buffer.resize(count);
     if(count > 0)
-        buffer.view().copy_from(values.data());
+    {
+        REQUIRE(!values.empty());
+        // Repeat the original valid geometry for larger CTA boundary cases.
+        // Every contact still owns a distinct output energy slot.
+        std::vector<T> repeated(static_cast<std::size_t>(count));
+        for(std::size_t i = 0; i < repeated.size(); ++i)
+            repeated[i] = values[i % values.size()];
+        buffer.view().copy_from(repeated.data());
+    }
 }
 
 class EnergyFixture
 {
   public:
     static constexpr int MaxPerType = 5;
+    static constexpr int MaxTestCount = 513;
 
     EnergyFixture()
         : contact_tabular(Extent2D{1, 1})
@@ -267,10 +277,10 @@ class EnergyFixture
         REQUIRE(counts.ee >= 0);
         REQUIRE(counts.pe >= 0);
         REQUIRE(counts.pp >= 0);
-        REQUIRE(counts.pt <= MaxPerType);
-        REQUIRE(counts.ee <= MaxPerType);
-        REQUIRE(counts.pe <= MaxPerType);
-        REQUIRE(counts.pp <= MaxPerType);
+        REQUIRE(counts.pt <= MaxTestCount);
+        REQUIRE(counts.ee <= MaxTestCount);
+        REQUIRE(counts.pe <= MaxTestCount);
+        REQUIRE(counts.pp <= MaxTestCount);
 
         resize_and_copy_prefix(d_PTs, PTs, counts.pt);
         resize_and_copy_prefix(d_EEs, EEs, counts.ee);
@@ -387,6 +397,20 @@ TEST_CASE("IPC simplex normal-contact four-launch oracle matches fused energy",
     {
         fixture.compare(Counts{.pt = 2, .pe = 3});
         fixture.compare(Counts{.ee = 2, .pp = 3});
+    }
+    SECTION("CTA boundaries repeat valid contact geometry")
+    {
+        for(int count : std::array{127, 128, 129, 255, 256, 257, 511, 512, 513})
+        {
+            CAPTURE(count);
+            fixture.compare(Counts{.pt = count});
+            fixture.compare(Counts{.ee = count});
+            fixture.compare(Counts{.pe = count});
+            fixture.compare(Counts{.pp = count});
+        }
+        // At CTA256, type boundaries straddle 256 and the final PP entry
+        // starts the third block.
+        fixture.compare(Counts{.pt = 255, .ee = 1, .pe = 1, .pp = 256});
     }
     SECTION("reused capacities survive nonzero zero nonzero")
     {
