@@ -320,6 +320,7 @@ void GlobalLinearSystem::Impl::init()
     for(auto precond : local_preconditioner_view)
     {
         auto index = precond->m_subsystem->m_index;
+        local_preconditioner_owners_unique &= !diag_span[index].has_local_preconditioner;
         diag_span[index].has_local_preconditioner = true;
     }
 
@@ -650,9 +651,11 @@ bool GlobalLinearSystem::Impl::fused_pcg_update_apply_dot(
     cuda_tool::CVarView<IndexT>        converged,
     cudaStream_t                       stream)
 {
-    // A global preconditioner may couple arbitrary segments. Keep its exact
-    // upstream launch sequence until it provides its own whole-vector hook.
-    if(global_preconditioner)
+    // A global preconditioner may couple arbitrary segments. Multiple local
+    // preconditioners on one subsystem must also keep the reference sequence:
+    // update x/r once, apply all preconditioners, then take one dot product.
+    // Reject fusion before any hook or kernel can partially update the vectors.
+    if(global_preconditioner || !local_preconditioner_owners_unique)
         return false;
 
     UIPC_ASSERT(x.size() == p.size() && x.size() == r.size()

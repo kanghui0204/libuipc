@@ -315,3 +315,76 @@ TEST_CASE("matrix converter compact radix key sorts BCOO in place",
     REQUIRE(actual_cols == expected_cols);
     REQUIRE(actual_values == expected_values);
 }
+
+TEST_CASE("matrix converter clears empty output and reuses storage across shapes",
+          "[build_solve_focused][matrix_converter][compact_radix_key][empty_conversion]")
+{
+    cuda_tool::DeviceTripletMatrix<float, 1> from;
+    cuda_tool::DeviceBCOOMatrix<float, 1>    to;
+    MatrixConverter<float, 1>                converter;
+
+    auto convert_and_check = [&](int rows,
+                                 int cols,
+                                 const std::vector<int>& expected_rows,
+                                 const std::vector<int>& expected_cols,
+                                 const std::vector<float>& expected_values)
+    {
+        converter.convert(from, to);
+        CUDA_TOOL_CHECK(cudaGetLastError());
+        CUDA_TOOL_CHECK(cudaDeviceSynchronize());
+        REQUIRE(to.rows() == rows);
+        REQUIRE(to.cols() == cols);
+        REQUIRE(to.triplet_count() == expected_values.size());
+        REQUIRE(to.row_indices().size() == expected_rows.size());
+        REQUIRE(to.col_indices().size() == expected_cols.size());
+        REQUIRE(to.values().size() == expected_values.size());
+
+        std::vector<int> actual_rows(to.triplet_count());
+        std::vector<int> actual_cols(to.triplet_count());
+        std::vector<float> actual_values(to.triplet_count());
+        if(!expected_values.empty())
+        {
+            to.row_indices().copy_to(actual_rows.data());
+            to.col_indices().copy_to(actual_cols.data());
+            to.values().copy_to(actual_values.data());
+        }
+        REQUIRE(actual_rows == expected_rows);
+        REQUIRE(actual_cols == expected_cols);
+        REQUIRE(actual_values == expected_values);
+    };
+
+    // A real conversion into a fresh output must publish the empty shape.
+    from.resize(3, 5, 0);
+    convert_and_check(3, 5, {}, {}, {});
+
+    {
+        const std::array<int, 5> rows = {3, 0, 3, 1, 0};
+        const std::array<int, 5> cols = {4, 2, 4, 0, 2};
+        const std::array<float, 5> values = {2.0f, 4.0f, 8.0f, 16.0f, 32.0f};
+        from.resize(4, 5, rows.size());
+        from.row_indices().copy_from(rows.data());
+        from.col_indices().copy_from(cols.data());
+        from.values().copy_from(values.data());
+        convert_and_check(4, 5, {0, 1, 3}, {2, 0, 4}, {36.0f, 16.0f, 10.0f});
+    }
+
+    // Keep the same converter, input, and output: empty conversion must clear
+    // the previous three merged entries even if their capacity is retained.
+    from.resize(4, 5, 0);
+    convert_and_check(4, 5, {}, {}, {});
+    from.resize(0, 7, 0);
+    convert_and_check(0, 7, {}, {}, {});
+    from.resize(3, 2, 0);
+    convert_and_check(3, 2, {}, {}, {});
+
+    {
+        const std::array<int, 4> rows = {2, 0, 2, 1};
+        const std::array<int, 4> cols = {1, 0, 1, 0};
+        const std::array<float, 4> values = {1.0f, 2.0f, 4.0f, 8.0f};
+        from.resize(3, 2, rows.size());
+        from.row_indices().copy_from(rows.data());
+        from.col_indices().copy_from(cols.data());
+        from.values().copy_from(values.data());
+        convert_and_check(3, 2, {0, 1, 2}, {0, 0, 1}, {2.0f, 8.0f, 5.0f});
+    }
+}
