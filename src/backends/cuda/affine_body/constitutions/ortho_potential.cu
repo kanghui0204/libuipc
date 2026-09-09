@@ -1,3 +1,4 @@
+#include <utils/material_gradient_hessian_launch.h>
 #include <affine_body/affine_body_constitution.h>
 #include <affine_body/constitutions/ortho_potential_function.h>
 #include <utils/fixed_bank_soa_evd.h>
@@ -74,6 +75,45 @@ namespace
     }
 }  // namespace
 
+void launch_ortho_potential_gradient_hessian(const OrthoPotentialGradientHessianLaunchInfo& info)
+{
+    using namespace cuda_tool;
+    auto N             = info.qs.size();
+    auto gradient_only = info.gradient_only;
+
+    namespace AOP = sym::abd_ortho_potential;
+
+    int  n = (int)N;
+    if(n <= 0)
+        return;
+
+    if(gradient_only)
+    {
+        auto k = ortho_potential_compute_gradient_hessian_kernel<true>;
+        k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
+            info.qs,
+            info.volumes,
+            info.gradients,
+            info.hessians,
+            info.kappas,
+            info.dt,
+            n);
+    }
+    else
+    {
+        constexpr int BlockSize = 16;
+        auto k = ortho_potential_compute_gradient_hessian_kernel<false>;
+        k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
+            info.qs,
+            info.volumes,
+            info.gradients,
+            info.hessians,
+            info.kappas,
+            info.dt,
+            n);
+    }
+}
+
 class OrthoPotential final : public AffineBodyConstitution
 {
   public:
@@ -133,41 +173,9 @@ class OrthoPotential final : public AffineBodyConstitution
 
     virtual void do_compute_gradient_hessian(ComputeGradientHessianInfo& info) override
     {
-        using namespace cuda_tool;
-        auto N             = info.qs().size();
-        auto gradient_only = info.gradient_only();
-
-        namespace AOP = sym::abd_ortho_potential;
-
-        int  n = (int)N;
-        if(n <= 0)
-            return;
-
-        if(gradient_only)
-        {
-            auto k = ortho_potential_compute_gradient_hessian_kernel<true>;
-            k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
-                info.qs(),
-                info.volumes(),
-                info.gradients(),
-                info.hessians(),
-                kappas.cview(),
-                info.dt(),
-                n);
-        }
-        else
-        {
-            constexpr int BlockSize = 16;
-            auto k = ortho_potential_compute_gradient_hessian_kernel<false>;
-            k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
-                info.qs(),
-                info.volumes(),
-                info.gradients(),
-                info.hessians(),
-                kappas.cview(),
-                info.dt(),
-                n);
-        }
+        launch_ortho_potential_gradient_hessian(OrthoPotentialGradientHessianLaunchInfo{
+            info.qs(), info.volumes(), info.gradients(), info.hessians(),
+            kappas.cview(), info.dt(), info.gradient_only()});
     }
 };
 

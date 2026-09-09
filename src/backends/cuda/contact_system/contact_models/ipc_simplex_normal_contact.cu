@@ -1,5 +1,6 @@
 #include <contact_system/simplex_normal_contact.h>
 #include <contact_system/contact_models/codim_ipc_simplex_normal_contact_function.h>
+#include <contact_system/contact_models/ipc_simplex_normal_contact_assembly.h>
 #include <utils/distance/distance_flagged.h>
 #include <utils/codim_thickness.h>
 #include <utils/fixed_bank_soa_evd.h>
@@ -546,97 +547,120 @@ class IPCSimplexNormalContact final : public SimplexNormalContact
 
     virtual void do_assemble(ContactInfo& info) override
     {
-        using namespace cuda_tool;
-        using namespace sym::codim_ipc_simplex_contact;
-
-        constexpr SizeT IndexMax =
-            static_cast<SizeT>(std::numeric_limits<IndexT>::max());
-        UIPC_ASSERT(info.PTs().size() <= IndexMax && info.EEs().size() <= IndexMax
-                        && info.PEs().size() <= IndexMax
-                        && info.PPs().size() <= IndexMax,
-                    "Simplex normal contact count exceeds the IndexT limit: PT={}, EE={}, PE={}, PP={}",
-                    info.PTs().size(),
-                    info.EEs().size(),
-                    info.PEs().size(),
-                    info.PPs().size());
-
-        auto pt_count = static_cast<IndexT>(info.PTs().size());
-        auto ee_count = static_cast<IndexT>(info.EEs().size());
-        auto pe_count = static_cast<IndexT>(info.PEs().size());
-        auto pp_count = static_cast<IndexT>(info.PPs().size());
-
-        const std::uint64_t total_wide =
-            static_cast<std::uint64_t>(pt_count)
-            + static_cast<std::uint64_t>(ee_count)
-            + static_cast<std::uint64_t>(pe_count)
-            + static_cast<std::uint64_t>(pp_count);
-        UIPC_ASSERT(total_wide <= static_cast<std::uint64_t>(IndexMax),
-                    "Simplex normal contact total {} exceeds the IndexT limit {}",
-                    total_wide,
-                    IndexMax);
-        const auto total = static_cast<IndexT>(total_wide);
-
-        constexpr int FullHessianBlockSize = 8;
-        const auto padded_layout =
-            make_contact_type_block_layout<FullHessianBlockSize>(
-                pt_count, ee_count, pe_count, pp_count);
-
-        if(total == 0)
-            return;
-
-        // Keep all contact types in one launch: rare PT/EE Hessians are
-        // individually expensive, and splitting them serializes work that the
-        // fused launch overlaps with the dominant PE population. Specialize
-        // only the uniform gradient/Hessian branch.
-        auto launch = [&]<bool GradientOnly>()
-        {
-            auto k = do_assemble_kernel<GradientOnly>;
-            const IndexT pt_end = pt_count;
-            const IndexT ee_offset = GradientOnly ? pt_count : padded_layout.ee_offset;
-            const IndexT ee_end = ee_offset + ee_count;
-            const IndexT pe_offset = GradientOnly ? ee_end : padded_layout.pe_offset;
-            const IndexT pe_end = pe_offset + pe_count;
-            const IndexT pp_offset = GradientOnly ? pe_end : padded_layout.pp_offset;
-            const int launch_size = GradientOnly ? total : padded_layout.padded_total;
-            const int block_size = GradientOnly ? cuda_tool::best_block_dim(k) :
-                                                  FullHessianBlockSize;
-            const int grid_size = launch_size / block_size
-                                  + (launch_size % block_size != 0);
-            k<<<grid_size, block_size, 0, nullptr>>>(
-                info.contact_tabular().viewer(),
-                info.contact_element_ids().viewer(),
-                info.positions().viewer(),
-                info.rest_positions().viewer(),
-                info.thicknesses().viewer(),
-                info.d_hats().viewer(),
-                info.dt(),
-                info.PTs().viewer(),
-                info.PT_gradients().viewer(),
-                info.PT_hessians().viewer(),
-                info.EEs().viewer(),
-                info.EE_gradients().viewer(),
-                info.EE_hessians().viewer(),
-                info.PEs().viewer(),
-                info.PE_gradients().viewer(),
-                info.PE_hessians().viewer(),
-                info.PPs().viewer(),
-                info.PP_gradients().viewer(),
-                info.PP_hessians().viewer(),
-                pt_end,
-                ee_offset,
-                ee_end,
-                pe_offset,
-                pe_end,
-                pp_offset,
-                launch_size);
-        };
-
-        if(info.gradient_only())
-            launch.operator()<true>();
-        else
-            launch.operator()<false>();
+        launch_ipc_simplex_normal_contact_assembly(
+            IPCSimplexNormalContactAssemblyLaunchInfo{
+                .contact_tabular     = info.contact_tabular(),
+                .contact_element_ids = info.contact_element_ids(),
+                .positions           = info.positions(),
+                .rest_positions      = info.rest_positions(),
+                .thicknesses         = info.thicknesses(),
+                .d_hats              = info.d_hats(),
+                .PTs                 = info.PTs(),
+                .EEs                 = info.EEs(),
+                .PEs                 = info.PEs(),
+                .PPs                 = info.PPs(),
+                .PT_gradients        = info.PT_gradients(),
+                .PT_hessians         = info.PT_hessians(),
+                .EE_gradients        = info.EE_gradients(),
+                .EE_hessians         = info.EE_hessians(),
+                .PE_gradients        = info.PE_gradients(),
+                .PE_hessians         = info.PE_hessians(),
+                .PP_gradients        = info.PP_gradients(),
+                .PP_hessians         = info.PP_hessians(),
+                .dt                  = info.dt(),
+                .gradient_only       = info.gradient_only()});
     }
 };
+
+void launch_ipc_simplex_normal_contact_assembly(
+    const IPCSimplexNormalContactAssemblyLaunchInfo& info)
+{
+    using namespace cuda_tool;
+    using namespace sym::codim_ipc_simplex_contact;
+
+    constexpr SizeT IndexMax =
+        static_cast<SizeT>(std::numeric_limits<IndexT>::max());
+    UIPC_ASSERT(info.PTs.size() <= IndexMax && info.EEs.size() <= IndexMax
+                    && info.PEs.size() <= IndexMax && info.PPs.size() <= IndexMax,
+                "Simplex normal contact count exceeds the IndexT limit: PT={}, EE={}, PE={}, PP={}",
+                info.PTs.size(),
+                info.EEs.size(),
+                info.PEs.size(),
+                info.PPs.size());
+
+    auto pt_count = static_cast<IndexT>(info.PTs.size());
+    auto ee_count = static_cast<IndexT>(info.EEs.size());
+    auto pe_count = static_cast<IndexT>(info.PEs.size());
+    auto pp_count = static_cast<IndexT>(info.PPs.size());
+
+    const std::uint64_t total_wide = static_cast<std::uint64_t>(pt_count)
+                                     + static_cast<std::uint64_t>(ee_count)
+                                     + static_cast<std::uint64_t>(pe_count)
+                                     + static_cast<std::uint64_t>(pp_count);
+    UIPC_ASSERT(total_wide <= static_cast<std::uint64_t>(IndexMax),
+                "Simplex normal contact total {} exceeds the IndexT limit {}",
+                total_wide,
+                IndexMax);
+    const auto total = static_cast<IndexT>(total_wide);
+
+    constexpr int FullHessianBlockSize = 8;
+    const auto padded_layout = make_contact_type_block_layout<FullHessianBlockSize>(
+        pt_count, ee_count, pe_count, pp_count);
+
+    if(total == 0)
+        return;
+
+    // Keep all contact types in one launch: rare PT/EE Hessians are
+    // individually expensive, and splitting them serializes work that the
+    // fused launch overlaps with the dominant PE population. Specialize
+    // only the uniform gradient/Hessian branch.
+    auto launch = [&]<bool GradientOnly>()
+    {
+        auto k = do_assemble_kernel<GradientOnly>;
+        const IndexT pt_end = pt_count;
+        const IndexT ee_offset = GradientOnly ? pt_count : padded_layout.ee_offset;
+        const IndexT ee_end = ee_offset + ee_count;
+        const IndexT pe_offset = GradientOnly ? ee_end : padded_layout.pe_offset;
+        const IndexT pe_end = pe_offset + pe_count;
+        const IndexT pp_offset = GradientOnly ? pe_end : padded_layout.pp_offset;
+        const int launch_size = GradientOnly ? total : padded_layout.padded_total;
+        const int block_size = GradientOnly ? cuda_tool::best_block_dim(k) :
+                                              FullHessianBlockSize;
+        const int grid_size = launch_size / block_size + (launch_size % block_size != 0);
+        k<<<grid_size, block_size, 0, nullptr>>>(
+            info.contact_tabular.viewer(),
+            info.contact_element_ids.viewer(),
+            info.positions.viewer(),
+            info.rest_positions.viewer(),
+            info.thicknesses.viewer(),
+            info.d_hats.viewer(),
+            info.dt,
+            info.PTs.viewer(),
+            info.PT_gradients.viewer(),
+            info.PT_hessians.viewer(),
+            info.EEs.viewer(),
+            info.EE_gradients.viewer(),
+            info.EE_hessians.viewer(),
+            info.PEs.viewer(),
+            info.PE_gradients.viewer(),
+            info.PE_hessians.viewer(),
+            info.PPs.viewer(),
+            info.PP_gradients.viewer(),
+            info.PP_hessians.viewer(),
+            pt_end,
+            ee_offset,
+            ee_end,
+            pe_offset,
+            pe_end,
+            pp_offset,
+            launch_size);
+    };
+
+    if(info.gradient_only)
+        launch.operator()<true>();
+    else
+        launch.operator()<false>();
+}
 
 REGISTER_SIM_SYSTEM(IPCSimplexNormalContact);
 }  // namespace uipc::backend::cuda

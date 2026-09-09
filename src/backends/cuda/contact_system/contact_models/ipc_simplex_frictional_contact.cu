@@ -1,5 +1,6 @@
 #include <contact_system/simplex_frictional_contact.h>
 #include <contact_system/contact_models/codim_ipc_simplex_frictional_contact_function.h>
+#include <contact_system/contact_models/ipc_simplex_frictional_contact_assembly.h>
 #include <utils/codim_thickness.h>
 #include <utils/fixed_bank_soa_evd.h>
 #include <utils/contact_type_block_layout.h>
@@ -532,6 +533,58 @@ namespace
 
 }  // namespace
 
+void launch_ipc_simplex_frictional_contact_assembly(
+    const IPCSimplexFrictionalContactAssemblyLaunchInfo& info)
+{
+    const auto layout = make_contact_type_contiguous_layout<IndexT>(
+        info.PTs.size(), info.EEs.size(), info.PEs.size(), info.PPs.size());
+    const IndexT total = layout.pp_end;
+    if(total == 0)
+        return;
+
+    // Keep the production contiguous PT | EE | PE | PP dispatch and launch
+    // geometry in one place, shared by the system and focused tests.
+    auto launch = [&]<bool GradientOnly>()
+    {
+        auto k = do_assemble_kernel<GradientOnly>;
+        const int block_size = GradientOnly ? cuda_tool::best_block_dim(k) : 12;
+        const int grid_size  = GradientOnly ?
+                                   cuda_tool::best_grid_dim(total, k) :
+                                   total / block_size + (total % block_size != 0);
+        k<<<grid_size, block_size, 0, nullptr>>>(
+            info.contact_tabular.viewer(),
+            info.contact_element_ids.viewer(),
+            info.positions.viewer(),
+            info.prev_positions.viewer(),
+            info.rest_positions.viewer(),
+            info.thicknesses.viewer(),
+            info.d_hats.viewer(),
+            info.eps_velocity,
+            info.dt,
+            info.PTs.viewer(),
+            info.PT_gradients,
+            info.PT_hessians,
+            info.EEs.viewer(),
+            info.EE_gradients,
+            info.EE_hessians,
+            info.PEs.viewer(),
+            info.PE_gradients,
+            info.PE_hessians,
+            info.PPs.viewer(),
+            info.PP_gradients,
+            info.PP_hessians,
+            layout.pt_end,
+            layout.ee_end,
+            layout.pe_end,
+            total);
+    };
+
+    if(info.gradient_only)
+        launch.operator()<true>();
+    else
+        launch.operator()<false>();
+}
+
 class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
 {
   public:
@@ -615,66 +668,30 @@ class IPCSimplexFrictionalContact final : public SimplexFrictionalContact
 
     virtual void do_assemble(ContactInfo& info) override
     {
-        using namespace cuda_tool;
-        using namespace sym::codim_ipc_contact;
-
-        const auto layout = make_contact_type_contiguous_layout<IndexT>(
-            info.friction_PTs().size(),
-            info.friction_EEs().size(),
-            info.friction_PEs().size(),
-            info.friction_PPs().size());
-        const IndexT total = layout.pp_end;
-
-        if(total == 0)
-            return;
-
-        const IndexT ee_offset = layout.pt_end;
-        const IndexT pe_offset = layout.ee_end;
-        const IndexT pp_offset = layout.pe_end;
-
-        // Keep all contact types in one launch so rare, expensive PT/EE work
-        // overlaps the dominant PE population. Specialize only the uniform
-        // gradient/Hessian branch.
-        auto launch = [&]<bool GradientOnly>()
-        {
-            auto k = do_assemble_kernel<GradientOnly>;
-            const int block_size = GradientOnly ? cuda_tool::best_block_dim(k) : 12;
-            const int grid_size  = GradientOnly ?
-                                       cuda_tool::best_grid_dim(total, k) :
-                                       total / block_size
-                                           + (total % block_size != 0);
-            k<<<grid_size, block_size, 0, nullptr>>>(
-                info.contact_tabular().viewer(),
-                info.contact_element_ids().viewer(),
-                info.positions().viewer(),
-                info.prev_positions().viewer(),
-                info.rest_positions().viewer(),
-                info.thicknesses().viewer(),
-                info.d_hats().viewer(),
-                info.eps_velocity(),
-                info.dt(),
-                info.friction_PTs().viewer(),
-                info.friction_PT_gradients().viewer(),
-                info.friction_PT_hessians().viewer(),
-                info.friction_EEs().viewer(),
-                info.friction_EE_gradients().viewer(),
-                info.friction_EE_hessians().viewer(),
-                info.friction_PEs().viewer(),
-                info.friction_PE_gradients().viewer(),
-                info.friction_PE_hessians().viewer(),
-                info.friction_PPs().viewer(),
-                info.friction_PP_gradients().viewer(),
-                info.friction_PP_hessians().viewer(),
-                ee_offset,
-                pe_offset,
-                pp_offset,
-                total);
-        };
-
-        if(info.gradient_only())
-            launch.operator()<true>();
-        else
-            launch.operator()<false>();
+        launch_ipc_simplex_frictional_contact_assembly(
+            IPCSimplexFrictionalContactAssemblyLaunchInfo{
+                .contact_tabular     = info.contact_tabular(),
+                .contact_element_ids = info.contact_element_ids(),
+                .positions           = info.positions(),
+                .prev_positions      = info.prev_positions(),
+                .rest_positions      = info.rest_positions(),
+                .thicknesses         = info.thicknesses(),
+                .d_hats              = info.d_hats(),
+                .PTs                 = info.friction_PTs(),
+                .EEs                 = info.friction_EEs(),
+                .PEs                 = info.friction_PEs(),
+                .PPs                 = info.friction_PPs(),
+                .PT_gradients        = info.friction_PT_gradients(),
+                .PT_hessians         = info.friction_PT_hessians(),
+                .EE_gradients        = info.friction_EE_gradients(),
+                .EE_hessians         = info.friction_EE_hessians(),
+                .PE_gradients        = info.friction_PE_gradients(),
+                .PE_hessians         = info.friction_PE_hessians(),
+                .PP_gradients        = info.friction_PP_gradients(),
+                .PP_hessians         = info.friction_PP_hessians(),
+                .eps_velocity        = info.eps_velocity(),
+                .dt                  = info.dt(),
+                .gradient_only       = info.gradient_only()});
     }
 };
 

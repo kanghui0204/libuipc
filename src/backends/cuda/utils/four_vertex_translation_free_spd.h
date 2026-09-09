@@ -52,6 +52,15 @@ UIPC_DEVICE bool selfadjoint_evd_four_vertex_translation_free_fixed_bank(
 {
     using namespace four_vertex_translation_free_spd_detail;
 
+    // Each transform sums four coefficients before applying its 0.5 factor.
+    // Across both transforms the largest intermediate is bounded by eight
+    // times the largest input coefficient. Normalize only the extreme range:
+    // the ordinary contact path keeps its existing floating-point operations.
+    const Float input_scale = H.cwiseAbs().maxCoeff();
+    const bool normalize_input = input_scale > DBL_MAX / 8.0;
+    if(normalize_input)
+        H /= input_scale;
+
     // Form H * Q in the first nine logical 12D columns.
 #pragma unroll
     for(int row = 0; row < 12; ++row)
@@ -117,6 +126,8 @@ UIPC_DEVICE bool selfadjoint_evd_four_vertex_translation_free_fixed_bank(
 #pragma unroll
     for(int i = 0; i < 9; ++i)
         eigen_values(i) = reduced_eigen_values(i);
+    if(normalize_input)
+        eigen_values.template head<9>() *= input_scale;
 
     // Lift the nine eigenvectors back to four vertices.  Reverse column order
     // keeps expanded 12-stride destinations from overwriting compact sources.

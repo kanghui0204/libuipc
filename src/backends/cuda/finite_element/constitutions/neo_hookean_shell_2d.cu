@@ -1,3 +1,4 @@
+#include <utils/material_gradient_hessian_launch.h>
 #include <finite_element/codim_2d_constitution.h>
 #include <finite_element/constitutions/neo_hookean_shell_2d_function.h>
 #include <kernel_cout.h>
@@ -126,6 +127,49 @@ namespace
     }
 }  // namespace
 
+void launch_neo_hookean_shell_gradient_hessian(const NeoHookeanShellGradientHessianLaunchInfo& info)
+{
+    int  n = (int)info.indices.size();
+    if(n <= 0)
+        return;
+
+    if(info.gradient_only)
+    {
+        auto k = NeoHookeanShell2D_do_compute_gradient_hessian_kernel<true>;
+        k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
+            info.lambdas,
+            info.mus,
+            info.indices,
+            info.positions,
+            info.inverse_rest_shape_matrices,
+            info.thicknesses,
+            info.gradients,
+            info.hessians,
+            info.rest_areas,
+            info.dt,
+            HalfHessianSize,
+            n);
+    }
+    else
+    {
+        constexpr int BlockSize = 32;
+        auto k = NeoHookeanShell2D_do_compute_gradient_hessian_kernel<false>;
+        k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
+            info.lambdas,
+            info.mus,
+            info.indices,
+            info.positions,
+            info.inverse_rest_shape_matrices,
+            info.thicknesses,
+            info.gradients,
+            info.hessians,
+            info.rest_areas,
+            info.dt,
+            HalfHessianSize,
+            n);
+    }
+}
+
 class NeoHookeanShell2D final : public Codim2DConstitution
 {
   public:
@@ -241,45 +285,10 @@ class NeoHookeanShell2D final : public Codim2DConstitution
 
     virtual void do_compute_gradient_hessian(ComputeGradientHessianInfo& info) override
     {
-        int  n = (int)info.indices().size();
-        if(n <= 0)
-            return;
-
-        if(info.gradient_only())
-        {
-            auto k = NeoHookeanShell2D_do_compute_gradient_hessian_kernel<true>;
-            k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
-                lambdas.cview(),
-                mus.cview(),
-                info.indices(),
-                info.xs(),
-                inv_B_matrices.cview(),
-                info.thicknesses(),
-                info.gradients(),
-                info.hessians(),
-                info.rest_areas(),
-                info.dt(),
-                HalfHessianSize,
-                n);
-        }
-        else
-        {
-            constexpr int BlockSize = 32;
-            auto k = NeoHookeanShell2D_do_compute_gradient_hessian_kernel<false>;
-            k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
-                lambdas.cview(),
-                mus.cview(),
-                info.indices(),
-                info.xs(),
-                inv_B_matrices.cview(),
-                info.thicknesses(),
-                info.gradients(),
-                info.hessians(),
-                info.rest_areas(),
-                info.dt(),
-                HalfHessianSize,
-                n);
-        }
+        launch_neo_hookean_shell_gradient_hessian(NeoHookeanShellGradientHessianLaunchInfo{
+            lambdas.cview(), mus.cview(), info.indices(), info.xs(),
+            inv_B_matrices.cview(), info.thicknesses(), info.gradients(),
+            info.hessians(), info.rest_areas(), info.dt(), info.gradient_only()});
     }
 };
 
