@@ -1,3 +1,4 @@
+#include <utils/material_gradient_hessian_launch.h>
 #include <finite_element/finite_element_extra_constitution.h>
 #include <finite_element/finite_element_method.h>
 #include <time_integrator/time_integrator.h>
@@ -195,6 +196,51 @@ namespace
         }
     }
 }  // namespace
+
+void launch_stress_plastic_bending_gradient_hessian(const BendingGradientHessianLaunchInfo& info)
+{
+    int n = (int)info.stencils.size();
+    if(n <= 0)
+        return;
+
+    if(info.gradient_only)
+    {
+        auto k =
+            StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel<true>;
+        k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
+            info.stencils,
+            info.stiffnesses,
+            info.theta_bars,
+            info.yield_stresses,
+            info.h_bars,
+            info.volumes,
+            info.rest_lengths,
+            info.positions,
+            info.gradients,
+            info.hessians,
+            info.dt,
+            n);
+    }
+    else
+    {
+        auto k =
+            StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel<false>;
+        constexpr int BlockSize = 32;
+        k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
+            info.stencils,
+            info.stiffnesses,
+            info.theta_bars,
+            info.yield_stresses,
+            info.h_bars,
+            info.volumes,
+            info.rest_lengths,
+            info.positions,
+            info.gradients,
+            info.hessians,
+            info.dt,
+            n);
+    }
+}
 
 class StressPlasticDiscreteShellBending final : public FiniteElementExtraConstitution
 {
@@ -414,47 +460,11 @@ class StressPlasticDiscreteShellBending final : public FiniteElementExtraConstit
 
     virtual void do_compute_gradient_hessian(ComputeGradientHessianInfo& info) override
     {
-        int n = (int)stencils.size();
-        if(n <= 0)
-            return;
-
-        if(info.gradient_only())
-        {
-            auto k =
-                StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel<true>;
-            k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
-                stencils.view(),
-                bending_stiffnesses.view(),
-                theta_bars.view(),
-                yield_stresses.view(),
-                h_bars.view(),
-                V_bars.view(),
-                rest_lengths.view(),
-                info.xs(),
-                info.gradients(),
-                info.hessians(),
-                info.dt(),
-                n);
-        }
-        else
-        {
-            auto k =
-                StressPlasticDiscreteShellBending_do_compute_gradient_hessian_kernel<false>;
-            constexpr int BlockSize = 32;
-            k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
-                stencils.view(),
-                bending_stiffnesses.view(),
-                theta_bars.view(),
-                yield_stresses.view(),
-                h_bars.view(),
-                V_bars.view(),
-                rest_lengths.view(),
-                info.xs(),
-                info.gradients(),
-                info.hessians(),
-                info.dt(),
-                n);
-        }
+        launch_stress_plastic_bending_gradient_hessian(BendingGradientHessianLaunchInfo{
+            stencils.view(), bending_stiffnesses.view(), theta_bars.view(),
+            h_bars.view(), V_bars.view(), rest_lengths.view(), info.xs(),
+            info.gradients(), info.hessians(), info.dt(), info.gradient_only(),
+            yield_stresses.view()});
     }
 };
 REGISTER_SIM_SYSTEM(StressPlasticDiscreteShellBending);

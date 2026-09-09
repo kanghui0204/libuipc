@@ -1,3 +1,4 @@
+#include <utils/material_gradient_hessian_launch.h>
 #include <finite_element/finite_element_extra_constitution.h>
 #include <uipc/builtin/attribute_name.h>
 #include <finite_element/constitutions/discrete_shell_bending_function.h>
@@ -125,6 +126,47 @@ namespace
         }
     }
 }  // namespace
+
+void launch_discrete_shell_bending_gradient_hessian(const BendingGradientHessianLaunchInfo& info)
+{
+    int n = (int)info.stencils.size();
+    if(n <= 0)
+        return;
+
+    if(info.gradient_only)
+    {
+        auto k = DiscreteShellBending_do_compute_gradient_hessian_kernel<true>;
+        k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
+            info.stencils,
+            info.stiffnesses,
+            info.theta_bars,
+            info.h_bars,
+            info.volumes,
+            info.rest_lengths,
+            info.positions,
+            info.gradients,
+            info.hessians,
+            info.dt,
+            n);
+    }
+    else
+    {
+        auto k = DiscreteShellBending_do_compute_gradient_hessian_kernel<false>;
+        constexpr int BlockSize = 16;
+        k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
+            info.stencils,
+            info.stiffnesses,
+            info.theta_bars,
+            info.h_bars,
+            info.volumes,
+            info.rest_lengths,
+            info.positions,
+            info.gradients,
+            info.hessians,
+            info.dt,
+            n);
+    }
+}
 
 class DiscreteShellBending final : public FiniteElementExtraConstitution
 {
@@ -333,43 +375,10 @@ class DiscreteShellBending final : public FiniteElementExtraConstitution
 
     virtual void do_compute_gradient_hessian(ComputeGradientHessianInfo& info) override
     {
-        int n = (int)stencils.size();
-        if(n <= 0)
-            return;
-
-        if(info.gradient_only())
-        {
-            auto k = DiscreteShellBending_do_compute_gradient_hessian_kernel<true>;
-            k<<<cuda_tool::best_grid_dim(n, k), cuda_tool::best_block_dim(k), 0, nullptr>>>(
-                stencils.view(),
-                bending_stiffnesses.view(),
-                theta_bars.view(),
-                h_bars.view(),
-                V_bars.view(),
-                rest_lengths.view(),
-                info.xs(),
-                info.gradients(),
-                info.hessians(),
-                info.dt(),
-                n);
-        }
-        else
-        {
-            auto k = DiscreteShellBending_do_compute_gradient_hessian_kernel<false>;
-            constexpr int BlockSize = 16;
-            k<<<(n + BlockSize - 1) / BlockSize, BlockSize, 0, nullptr>>>(
-                stencils.view(),
-                bending_stiffnesses.view(),
-                theta_bars.view(),
-                h_bars.view(),
-                V_bars.view(),
-                rest_lengths.view(),
-                info.xs(),
-                info.gradients(),
-                info.hessians(),
-                info.dt(),
-                n);
-        }
+        launch_discrete_shell_bending_gradient_hessian(BendingGradientHessianLaunchInfo{
+            stencils.view(), bending_stiffnesses.view(), theta_bars.view(),
+            h_bars.view(), V_bars.view(), rest_lengths.view(), info.xs(),
+            info.gradients(), info.hessians(), info.dt(), info.gradient_only()});
     }
 };
 
